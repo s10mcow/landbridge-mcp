@@ -1,0 +1,43 @@
+{
+  "name": "@landbridge/mcp-server",
+  "version": "0.1.0",
+  "description": "LandBridge MCP server — AI assistant tools for land investment CRM",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "landbridge-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "landbridge",
+    "real-estate",
+    "crm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/s10mcow/landbridge-mcp"
+  },
+  "license": "MIT",
+  "author": "LandBridge"
+}
