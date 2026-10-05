@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { basename } from "node:path";
+import { basename, extname } from "node:path";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -101,7 +101,17 @@ export function createApiClient(config: ApiClientConfig): ApiClient {
     const fileBuffer = readFileSync(filePath);
     const fileName = basename(filePath);
     const formData = new FormData();
-    formData.append("file", new Blob([fileBuffer]), fileName);
+    const mimeTypes: Record<string, string> = {
+      ".csv": "text/csv",
+      ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".webp": "image/webp",
+      ".gif": "image/gif",
+    };
+    const type = mimeTypes[extname(fileName).toLowerCase()] ?? "application/octet-stream";
+    formData.append("file", new Blob([fileBuffer], { type }), fileName);
     if (fields) {
       for (const [key, value] of Object.entries(fields)) {
         formData.append(key, value);

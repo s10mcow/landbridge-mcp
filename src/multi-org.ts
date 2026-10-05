@@ -7,7 +7,7 @@ export type Organization = {
 };
 
 export type OrgMode =
-  | { kind: "cross"; organizations: Organization[] }
+  | { kind: "cross"; organizations: Organization[]; crossOrg?: boolean }
   | { kind: "single"; reason: string; homeOrganization?: Organization };
 
 export type LeadSearchParams = {
@@ -63,7 +63,10 @@ export function createMultiOrg(api: ApiClient) {
   async function detectMode(): Promise<OrgMode> {
     try {
       const body = await api.get("/cross-org/organizations");
-      return { kind: "cross", organizations: parseOrganizations(body) };
+      const crossOrg = isPlainObject(body) && typeof body.crossOrg === "boolean"
+        ? body.crossOrg
+        : undefined;
+      return { kind: "cross", organizations: parseOrganizations(body), crossOrg };
     } catch (error) {
       if (error instanceof ApiError && (error.status === 404 || error.status === 403)) {
         return {
@@ -87,7 +90,10 @@ export function createMultiOrg(api: ApiClient) {
   async function listOrganizations(): Promise<Record<string, unknown>> {
     const mode = await loadMode();
     if (mode.kind === "cross") {
-      return { crossOrg: true, organizations: mode.organizations };
+      return {
+        ...(mode.crossOrg === undefined ? {} : { crossOrg: mode.crossOrg }),
+        organizations: mode.organizations,
+      };
     }
     return {
       crossOrg: false,
@@ -445,7 +451,10 @@ export function createMultiOrg(api: ApiClient) {
     const mode = await loadMode();
     const orgId = cleanOrganizationId(organizationId);
     if (mode.kind === "single") return { ok: true, organizationId: orgId };
-    if (!orgId) {
+    // Older servers omit the credential flag. A single membership does not tell
+    // us whether this is a cross-org key; let the API enforce that case.
+    const requiresOrganization = mode.crossOrg ?? mode.organizations.length > 1;
+    if (!orgId && requiresOrganization) {
       return { ok: false, error: organizationRequiredPayload(mode.organizations) };
     }
     return { ok: true, organizationId: orgId };
@@ -485,7 +494,7 @@ function organizationRequiredPayload(organizations: Organization[]): Record<stri
   const message =
     organizations.length === 0
       ? "This key can act across companies, but no company memberships were returned, so there is nowhere to write. Do not guess a company."
-      : "This API key can act in more than one company, and organizationId was not provided. Pass organizationId copied from the search hit (or from the list below). Do not guess.";
+      : "This API key requires an explicit company for writes. Pass organizationId copied from the search hit (or from the list below). Do not guess.";
   return {
     error: "ORGANIZATION_REQUIRED",
     message,

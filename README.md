@@ -38,6 +38,8 @@ npm run build
 
 Cross-company tools call `/cross-org/...` on the API. Deploy that API before using a `crossOrg` key. An older key (no `crossOrg`) keeps working, and so does a server that has no `/cross-org` routes: searches stay on the key's home company, and the tool result says so.
 
+The organization-list response includes the key's `crossOrg` flag. HTTP 200 also applies to single-org keys; it does not imply cross-org credentials. A cross-org key needs `organizationId` even if it currently has only one membership. When an older API omits this metadata for a single membership, the server enforces the write requirement.
+
 Market-research routes are unchanged on the API and still use the key's home company. This server does not call them.
 
 ## How a call should go
@@ -62,10 +64,23 @@ Omit `organizationId` on those searches to cover every membership. A cross-org k
 | `list_leads`, `list_properties`, `list_tasks`, `get_kpis`, analytics tools | Still one company (home company unless `organizationId` is set). |
 | `create_lead`, `update_lead`, `delete_lead`, `add_contact_note` | Take `organizationId` and send it. |
 | `upload_lead_image`, `delete_lead_image` | Take `organizationId` and send it. |
-| `create_campaign` | New. Creates a campaign in the given company. |
+| `create_campaign` | Imports a local CSV or XLSX property file. Requires `name`, a unique `refId` prefix, and `filePath`; sends a multipart upload to the given company. |
 | `edit_campaign`, `delete_campaign` | Take `organizationId` and send it. |
 
 Writes send `X-Organization-Id`. JSON writes also include `organizationId` in the body. Deletes and GETs also send it as a query parameter when it is set.
+
+For `create_campaign`, pass an existing local CSV or XLSX property import file:
+
+```json
+{
+  "name": "Spring mailer",
+  "refId": "DNA",
+  "filePath": "/absolute/path/to/properties.csv",
+  "organizationId": "company-id-from-list_organizations"
+}
+```
+
+The file is uploaded with its CSV/XLSX content type along with `name`, `refId`, and the organization selector.
 
 The `landbridge://organization` resource is still the key's home company.
 

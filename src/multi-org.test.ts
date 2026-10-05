@@ -7,6 +7,7 @@ import { createApiClient } from "./api-client.js";
 import { createMultiOrg } from "./multi-org.js";
 
 const ORGS = {
+  crossOrg: true,
   organizations: [
     { organizationId: "org_north", name: "North Acre Co", role: "owner" },
     { organizationId: "org_south", name: "South Acre Co", role: "admin" },
@@ -227,6 +228,46 @@ test("a single-org key (403) falls back and writes do not require organizationId
   assert.deepEqual(post.body, { refId: "PB-CS-1015-2063" });
 });
 
+test("a single-org key receiving HTTP 200 keeps implicit home-company writes", async () => {
+  const { lb, calls } = client((seen) => {
+    if (seen.path === "/cross-org/organizations") return { body: { crossOrg: false, organizations: [ORGS.organizations[0]] } };
+    if (seen.method === "PATCH") return { body: { leadId: "lead_1" } };
+    return { status: 500 };
+  });
+  const listed = await lb.listOrganizations();
+  assert.equal(listed.crossOrg, false);
+  const result = await lb.mutate({ method: "PATCH", path: "/leads/lead_1", body: { name: "Updated" } });
+  assert.equal(result.ok, true);
+  assert.equal(orgHeader(calls.at(-1)!), null);
+  assert.deepEqual(calls.at(-1)?.body, { name: "Updated" });
+});
+
+test("a cross-org key with one membership still requires an explicit organization", async () => {
+  const { lb, calls } = client(() => ({ body: { crossOrg: true, organizations: [ORGS.organizations[0]] } }));
+  const result = await lb.mutate({ method: "PATCH", path: "/leads/lead_1", body: { name: "Updated" } });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.error, "ORGANIZATION_REQUIRED");
+  assert.equal(calls.length, 1);
+});
+
+for (const crossOrg of [false, true]) {
+  test(`a server without credential metadata enforces singleton writes itself (crossOrg=${crossOrg})`, async () => {
+    const { lb, calls } = client((seen) => {
+      if (seen.path === "/cross-org/organizations") return { body: { organizations: [ORGS.organizations[0]] } };
+      return crossOrg
+        ? { status: 400, body: { code: "ORGANIZATION_REQUIRED" } }
+        : { body: { leadId: "lead_1" } };
+    });
+    const listed = await lb.listOrganizations();
+    assert.equal("crossOrg" in listed, false);
+    const result = await lb.mutate({ method: "PATCH", path: "/leads/lead_1", body: { name: "Updated" } });
+    assert.equal(result.ok, !crossOrg);
+    if (!result.ok) assert.equal(result.error.error, "ORGANIZATION_REQUIRED");
+    assert.equal(calls.at(-1)?.method, "PATCH");
+    assert.equal(orgHeader(calls.at(-1)!), null);
+  });
+}
+
 test("cross-org writes without organizationId list companies and do not call the API", async () => {
   const { lb, calls } = client((seen) => {
     if (seen.path === "/cross-org/organizations") return { body: ORGS };
@@ -251,7 +292,7 @@ test("cross-org writes send the company on the header and in the body", async ()
     if (seen.path === "/cross-org/organizations") return { body: ORGS };
     if (seen.method === "PATCH") return { body: { id: "lead_1", stage: "NEGOTIATING" } };
     if (seen.method === "DELETE") return { status: 204 };
-    if (seen.method === "POST" && seen.path === "/campaigns") return { body: { id: "camp_9" } };
+    if (seen.method === "POST" && seen.path === "/leads") return { body: { id: "lead_9" } };
     return { status: 500, body: { message: seen.path } };
   });
 
@@ -282,13 +323,13 @@ test("cross-org writes send the company on the header and in the body", async ()
 
   const created = await lb.mutate({
     method: "POST",
-    path: "/campaigns",
+    path: "/leads",
     organizationId: "org_north",
-    body: { name: "Spring mailer" },
+    body: { refId: "DNA-1" },
   });
   assert.equal(created.ok, true);
   const post = calls.find((call) => call.method === "POST");
-  assert.deepEqual(post?.body, { name: "Spring mailer", organizationId: "org_north" });
+  assert.deepEqual(post?.body, { refId: "DNA-1", organizationId: "org_north" });
 });
 
 test("get_lead finds the record in the second company", async () => {

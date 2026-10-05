@@ -64,7 +64,7 @@ const writeOrg = z
   .string()
   .optional()
   .describe(
-    "Company id (organizationId) this change belongs to. Required when the API key can access more than one company. Copy it from the search hit or from list_organizations. If you omit it, the tool lists the companies instead of guessing.",
+    "Company id (organizationId) this change belongs to. Required for cross-org API keys, even with only one current membership. Copy it from the search hit or from list_organizations. If you omit it, the tool lists the companies instead of guessing.",
   );
 
 const filterOrg = z
@@ -432,18 +432,23 @@ server.tool(
 
 server.tool(
   "create_campaign",
-  "Create a campaign in a specific company. Pass organizationId from list_organizations or from a search hit. The new campaign is created in that company only.",
+  "Create a campaign by importing a local CSV or XLSX property file. Provide its name and a unique reference-code prefix (refId). Pass organizationId from list_organizations or a search hit to choose the company.",
   {
-    name: z.string().describe("Campaign name"),
+    name: z.string().trim().min(1).describe("Campaign name"),
+    refId: z.string().trim().min(1).describe("Unique campaign reference-code prefix, such as DNA"),
+    filePath: z.string().regex(/\.(csv|xlsx)$/i).describe("Absolute path to the CSV or XLSX property file to import"),
     organizationId: writeOrg,
   },
-  async ({ name, organizationId }) =>
-    run(async () => fromMutate(await lb.mutate({
-      method: "POST",
-      path: "/campaigns",
-      organizationId,
-      body: { name },
-    }))),
+  async ({ name, refId, filePath, organizationId }) =>
+    run(async () => {
+      if (!existsSync(filePath)) return fail({ error: "FILE_NOT_FOUND", message: "File not found: " + filePath });
+      return fromMutate(await lb.upload({
+        path: "/campaigns",
+        filePath,
+        fields: { name, refId },
+        organizationId,
+      }));
+    }),
 );
 
 server.tool(
