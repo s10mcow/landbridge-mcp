@@ -64,6 +64,7 @@ function json(res: ServerResponse, status: number, body: unknown) {
 
 test("update_property_enrichment writes markdown for one company and stamps enrichedAt", async () => {
   const started = Date.now();
+  const encodedPropertyPath = "/properties/prop%2F1%3Fv%3D2/enrichment";
   await withMcp(
     (_req, res, seen) => {
       if (seen.path === "/cross-org/organizations") {
@@ -76,7 +77,7 @@ test("update_property_enrichment writes markdown for one company and stamps enri
         });
         return;
       }
-      if (seen.method === "PATCH" && seen.path === "/properties/prop_1/enrichment") {
+      if (seen.method === "PATCH" && seen.path === encodedPropertyPath) {
         json(res, 200, {
           id: "prop_1",
           organizationId: "org-south",
@@ -95,6 +96,10 @@ test("update_property_enrichment writes markdown for one company and stamps enri
         assert.ok(tool.inputSchema.required?.includes(field));
       }
       assert.equal(tool.inputSchema.required?.includes("organizationId"), false);
+      const markdownSchema = tool.inputSchema.properties?.enrichmentMarkdown as
+        | { maxLength?: number }
+        | undefined;
+      assert.equal(markdownSchema?.maxLength, 100000);
 
       const refused = await client.callTool({
         name: "update_property_enrichment",
@@ -116,7 +121,7 @@ test("update_property_enrichment writes markdown for one company and stamps enri
       const result = await client.callTool({
         name: "update_property_enrichment",
         arguments: {
-          propertyId: " prop_1 ",
+          propertyId: " prop/1?v=2 ",
           enrichmentMarkdown: "# Public records\n\nOwner is on file.",
           organizationId: "org-south",
         },
@@ -132,7 +137,7 @@ test("update_property_enrichment writes markdown for one company and stamps enri
 
       const patch = calls.find((call) => call.method === "PATCH");
       assert.ok(patch);
-      assert.equal(patch.path, "/properties/prop_1/enrichment");
+      assert.equal(patch.path, encodedPropertyPath);
       assert.equal(patch.org, "org-south");
       const body = patch.body as {
         enrichmentMarkdown: string;
@@ -155,6 +160,29 @@ test("update_property_enrichment writes markdown for one company and stamps enri
       assert.ok(stamped >= started - 1000);
       assert.ok(stamped <= Date.now() + 1000);
       assert.equal(saved.enrichedAt, body.enrichedAt);
+    },
+  );
+});
+
+test("update_property_enrichment rejects markdown larger than 100k characters", async () => {
+  await withMcp(
+    (_req, res, seen) => {
+      json(res, 500, { message: `unexpected ${seen.method} ${seen.path}` });
+    },
+    async (client, calls) => {
+      const tooLarge = "a".repeat(100001);
+      const result = await client.callTool({
+        name: "update_property_enrichment",
+        arguments: {
+          propertyId: "prop_1",
+          enrichmentMarkdown: tooLarge,
+          organizationId: "org-south",
+        },
+      });
+      assert.equal(result.isError, true);
+      const text = (result.content as Array<{ text: string }>)[0].text;
+      assert.match(text, /100000|too_big|max/i);
+      assert.equal(calls.length, 0);
     },
   );
 });

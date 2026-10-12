@@ -84,6 +84,8 @@ const lookupOrg = z
   .optional()
   .describe("Company id to look in. Omit to check every company this key belongs to.");
 
+const MAX_ENRICHMENT_MARKDOWN_CHARS = 100_000;
+
 // ==================== READ TOOLS ====================
 
 server.tool(
@@ -305,8 +307,9 @@ server.tool(
     enrichmentMarkdown: z
       .string()
       .min(1)
+      .max(MAX_ENRICHMENT_MARKDOWN_CHARS)
       .describe(
-        "Public-records research in markdown. Replaces the property's current enrichmentMarkdown.",
+        `Public-records research in markdown (max ${MAX_ENRICHMENT_MARKDOWN_CHARS} characters). Replaces the property's current enrichmentMarkdown.`,
       ),
     organizationId: writeOrg,
   },
@@ -315,7 +318,7 @@ server.tool(
       fromMutate(
         await lb.mutate({
           method: "PATCH",
-          path: `/properties/${propertyId}/enrichment`,
+          path: `/properties/${encodeURIComponent(propertyId)}/enrichment`,
           organizationId,
           body: {
             enrichmentMarkdown,
