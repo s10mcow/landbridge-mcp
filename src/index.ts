@@ -9,7 +9,7 @@ import { createMultiOrg, type AcrossOrgsResult, type MutateResult } from "./mult
 
 const server = new McpServer({
   name: "landbridge",
-  version: "0.2.0",
+  version: "0.2.1",
 });
 
 const api = createApiClientFromEnv();
@@ -296,6 +296,35 @@ server.tool(
 );
 
 // ==================== WRITE TOOLS ====================
+
+server.tool(
+  "update_property_enrichment",
+  "Save public-records research on a property. Sets enrichmentMarkdown and stamps enrichedAt. The parcel must already belong to the company you pass. Pass organizationId from search_properties, or from the property on a search_leads hit. A cross-org key has to pass organizationId; the API rejects a property that is not in that company.",
+  {
+    propertyId: z.string().trim().min(1).describe("The property ID"),
+    enrichmentMarkdown: z
+      .string()
+      .min(1)
+      .describe(
+        "Public-records research in markdown. Replaces the property's current enrichmentMarkdown.",
+      ),
+    organizationId: writeOrg,
+  },
+  async ({ propertyId, enrichmentMarkdown, organizationId }) =>
+    run(async () =>
+      fromMutate(
+        await lb.mutate({
+          method: "PATCH",
+          path: `/properties/${propertyId}/enrichment`,
+          organizationId,
+          body: {
+            enrichmentMarkdown,
+            enrichedAt: new Date().toISOString(),
+          },
+        }),
+      ),
+    ),
+);
 
 server.tool(
   "update_lead",
