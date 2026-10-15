@@ -15,6 +15,9 @@ export type LeadSearchParams = {
   searchBy?: "name" | "address" | "apn" | "phone" | "refId";
   organizationId?: string;
   limit?: number;
+  ddStatus?: "NOT_STARTED" | "IN_PROGRESS" | "COMPLETE" | "PASS";
+  valueMin?: number;
+  valueMax?: number;
 };
 
 export type PropertySearchParams = {
@@ -110,6 +113,9 @@ export function createMultiOrg(api: ApiClient) {
         query: params.query,
         searchBy: params.searchBy,
         limit: params.limit,
+        ddStatus: params.ddStatus,
+        valueMin: params.valueMin,
+        valueMax: params.valueMax,
       },
       organizationId: params.organizationId,
       emptyMessage: "No leads found.",
