@@ -133,8 +133,8 @@ test("upsert_due_diligence writes a partial parcel record for one company", asyn
       const tools = await client.listTools();
       const tool = tools.tools.find((entry) => entry.name === "upsert_due_diligence");
       assert.ok(tool);
-      assert.equal(tool.inputSchema.required?.includes("organizationId"), false);
-      assert.equal(tool.inputSchema.required?.includes("leadId"), false);
+      assert.equal(tool.inputSchema.required?.includes("organizationId") ?? false, false);
+      assert.equal(tool.inputSchema.required?.includes("leadId") ?? false, false);
       assert.equal(maxLength(findSchema(tool.inputSchema, "legalDescription")), MAX_DD_LONG_TEXT);
 
       const refused = await client.callTool({
