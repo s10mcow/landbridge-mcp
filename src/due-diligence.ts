@@ -1,17 +1,17 @@
 import { z } from "zod";
+import { ApiError } from "./api-client.js";
 
 /** Free-text fields such as zoning, owner, and road notes. */
 export const MAX_DD_SHORT_TEXT = 2_000;
 /** Legal description, covenants, rationale, and other long notes. */
 export const MAX_DD_LONG_TEXT = 20_000;
 export const MAX_DD_URL = 2_000;
-export const MAX_DD_ITEMS = 50;
 /** Whole JSON body, matching the property-enrichment markdown cap. */
 export const MAX_DUE_DILIGENCE_JSON_CHARS = 100_000;
 
 export const DD_STATUS = ["NOT_STARTED", "IN_PROGRESS", "COMPLETE", "PASS"] as const;
 export const ITEM_STATUS = ["OPEN", "VERIFIED", "NA"] as const;
-export const ITEM_KIND = ["risk", "open_item"] as const;
+export const ITEM_KIND = ["RISK", "OPEN_ITEM"] as const;
 export const COMP_STATUS = ["SOLD", "ACTIVE"] as const;
 export const ROAD_TYPE = ["PAVED", "GRAVEL", "DIRT", "NONE"] as const;
 export const ROAD_MAINTENANCE = ["COUNTY", "PRIVATE"] as const;
@@ -26,6 +26,13 @@ export type TargetResult =
   | { ok: true; path: string; identity: Record<string, string> }
   | { ok: false; error: ToolError };
 
+const MONEY_FIELDS: Record<string, readonly string[]> = {
+  title: ["deedPrice"],
+  values: ["landValue", "assessedValue", "taxAmount"],
+  restrictions: ["dues"],
+  valuation: ["marketValueLow", "marketValueHigh", "offerLow", "offerHigh", "offerTarget"],
+};
+
 function shortText() {
   return z.string().trim().min(1).max(MAX_DD_SHORT_TEXT);
 }
@@ -34,32 +41,53 @@ function longText() {
   return z.string().trim().min(1).max(MAX_DD_LONG_TEXT);
 }
 
-function money() {
-  return z.number().finite().nonnegative();
+/** Currency on the wire is a 2-decimal string. Callers may pass a number or "15000.5". */
+function amount() {
+  return z.union([
+    z.number().finite().nonnegative(),
+    z.string().trim().regex(/^(?:\d+|\d+\.\d{1,2})$/),
+  ]);
 }
 
-const itemSchema = z
-  .object({
-    id: z
-      .string()
-      .trim()
-      .min(1)
-      .max(200)
-      .optional()
-      .describe("Existing item id. Omit to let the API assign one."),
-    text: longText().describe("The risk, or what still needs to be checked."),
-    status: z.enum(ITEM_STATUS).describe("OPEN, VERIFIED, or NA (n/a)."),
-    sourceUrl: z
-      .string()
-      .trim()
-      .min(1)
-      .max(MAX_DD_URL)
-      .optional()
-      .describe("Page or document that supports this item."),
-  })
-  .strict();
+export function dateInput() {
+  return z
+    .string()
+    .trim()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .refine(isIsoDate, "Date must be a real YYYY-MM-DD date.");
+}
+
+function isoDate() {
+  return dateInput();
+}
+
+export function formatAmount(value: unknown): string {
+  const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    throw new Error("Amount must be a non-negative number with at most two decimal places.");
+  }
+  return numeric.toFixed(2);
+}
+
+function isIsoDate(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
 
 export const dueDiligenceSections = {
+  expectedRevision: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe(
+      "Revision from the last get_due_diligence read. A stale revision comes back as 409 DD_CONFLICT; read again and retry.",
+    ),
   status: z
     .enum(DD_STATUS)
     .optional()
@@ -75,15 +103,15 @@ export const dueDiligenceSections = {
     })
     .strict()
     .optional()
-    .describe("Legal description, plat, acreage, dimensions, and subdivision. APN is the separate apn argument."),
+    .describe("Legal description, plat, acreage, dimensions, and subdivision. The APN is parcelApn."),
   title: z
     .object({
       ownerOfRecord: shortText().optional(),
       deedBook: shortText().optional(),
       deedPage: shortText().optional(),
-      deedDate: shortText().optional().describe("Deed date as printed, such as 1998-03-02."),
-      deedPrice: money().optional(),
-      sellerRelation: z
+      deedDate: isoDate().optional().describe("Deed date as YYYY-MM-DD."),
+      deedPrice: amount().optional().describe("Deed price. Sent as a 2-decimal string."),
+      seller: z
         .enum(SELLER_RELATION)
         .optional()
         .describe("How the seller relates to the owner of record: OWNER, SPOUSE, HEIR, ENTITY, or OTHER."),
@@ -93,18 +121,18 @@ export const dueDiligenceSections = {
     .optional(),
   values: z
     .object({
-      landValue: money().optional(),
-      assessedValue: money().optional(),
-      taxAmount: money().optional(),
+      landValue: amount().optional().describe("Sent as a 2-decimal string."),
+      assessedValue: amount().optional().describe("Sent as a 2-decimal string."),
+      taxAmount: amount().optional().describe("Sent as a 2-decimal string."),
       taxYear: z.number().int().min(1800).max(2200).optional(),
-      trusteeStatus: z.enum(TRUSTEE_STATUS).optional().describe("PAID or DELINQUENT."),
+      trustee: z.enum(TRUSTEE_STATUS).optional().describe("PAID or DELINQUENT."),
     })
     .strict()
     .optional()
     .describe("Land value, assessed value, tax, and trustee status."),
   access: z
     .object({
-      roadType: z.enum(ROAD_TYPE).optional().describe("PAVED, GRAVEL, DIRT, or NONE."),
+      road: z.enum(ROAD_TYPE).optional().describe("PAVED, GRAVEL, DIRT, or NONE."),
       maintenance: z.enum(ROAD_MAINTENANCE).optional().describe("COUNTY or PRIVATE."),
       notes: longText().optional(),
     })
@@ -124,7 +152,7 @@ export const dueDiligenceSections = {
     .object({
       hoa: z.boolean().optional().describe("True when an HOA or POA applies."),
       hoaName: shortText().optional(),
-      dues: money().optional().describe("HOA or POA dues amount."),
+      dues: amount().optional().describe("HOA or POA dues. Sent as a 2-decimal string."),
       covenants: longText().optional(),
       strAllowed: z.boolean().optional().describe("Short-term rentals allowed."),
       mobileHomesAllowed: z.boolean().optional(),
@@ -134,42 +162,27 @@ export const dueDiligenceSections = {
     .optional(),
   valuation: z
     .object({
-      marketValueLow: money().optional(),
-      marketValueHigh: money().optional(),
-      offerLow: money().optional(),
-      offerHigh: money().optional(),
-      offerTarget: money().optional(),
+      marketValueLow: amount().optional().describe("Sent as a 2-decimal string."),
+      marketValueHigh: amount().optional().describe("Sent as a 2-decimal string."),
+      offerLow: amount().optional().describe("Sent as a 2-decimal string."),
+      offerHigh: amount().optional().describe("Sent as a 2-decimal string."),
+      offerTarget: amount().optional().describe("Sent as a 2-decimal string."),
       rationale: longText().optional(),
     })
     .strict()
     .optional(),
-  risks: z
-    .array(itemSchema)
-    .max(MAX_DD_ITEMS)
-    .optional()
-    .describe(
-      `Replaces the full risks list for this parcel (max ${MAX_DD_ITEMS}). Use update_dd_item to change one item.`,
-    ),
-  openItems: z
-    .array(itemSchema)
-    .max(MAX_DD_ITEMS)
-    .optional()
-    .describe(
-      `Replaces the full open-items list for this parcel (max ${MAX_DD_ITEMS}). Use update_dd_item to check one off.`,
-    ),
 };
 
-const IDENTITY_KEYS = new Set(["apn", "propertyId"]);
+const NON_CONTENT_KEYS = new Set(["parcelApn", "propertyId", "expectedRevision"]);
 
 export function resolveDueDiligenceTarget(args: {
   leadId?: string;
   propertyId?: string;
-  apn?: string;
-  requireParcel: boolean;
+  parcelApn?: string;
 }): TargetResult {
   const leadId = args.leadId?.trim();
   const propertyId = args.propertyId?.trim();
-  const apn = args.apn?.trim();
+  const parcelApn = args.parcelApn?.trim();
   if (!leadId && !propertyId) {
     return {
       ok: false,
@@ -179,19 +192,10 @@ export function resolveDueDiligenceTarget(args: {
       },
     };
   }
-  if (leadId && args.requireParcel && !propertyId && !apn) {
-    return {
-      ok: false,
-      error: {
-        error: "PARCEL_REQUIRED",
-        message:
-          "This lead can have more than one parcel. Pass apn or propertyId for the parcel this due diligence belongs to.",
-      },
-    };
-  }
 
+  // The lead PATCH selects the parcel. Both selectors are optional when the lead has one parcel.
   const identity: Record<string, string> = {};
-  if (apn) identity.apn = apn;
+  if (leadId && parcelApn) identity.parcelApn = parcelApn;
   if (leadId && propertyId) identity.propertyId = propertyId;
   const path = leadId
     ? `/leads/${encodeURIComponent(leadId)}/due-diligence`
@@ -202,30 +206,21 @@ export function resolveDueDiligenceTarget(args: {
 export function dueDiligenceReadPath(args: {
   leadId?: string;
   propertyId?: string;
-  apn?: string;
+  parcelApn?: string;
 }): { ok: true; path: string } | { ok: false; error: ToolError } {
-  const target = resolveDueDiligenceTarget({ ...args, requireParcel: false });
+  const target = resolveDueDiligenceTarget(args);
   if (!target.ok) return target;
   const params = new URLSearchParams();
   const propertyId = args.propertyId?.trim();
-  const apn = args.apn?.trim();
+  const parcelApn = args.parcelApn?.trim();
   if (args.leadId?.trim() && propertyId) params.set("propertyId", propertyId);
-  if (apn) params.set("apn", apn);
+  if (args.leadId?.trim() && parcelApn) params.set("parcelApn", parcelApn);
   const qs = params.toString();
   return { ok: true, path: qs ? `${target.path}?${qs}` : target.path };
 }
 
-export function valueRangeError(valueMin?: number, valueMax?: number): ToolError | undefined {
-  if (valueMin !== undefined && valueMax !== undefined && valueMin > valueMax) {
-    return {
-      error: "VALUE_RANGE_INVALID",
-      message: "valueMin cannot be greater than valueMax.",
-    };
-  }
-  return undefined;
-}
-
 type SectionInput = {
+  expectedRevision?: number;
   status?: (typeof DD_STATUS)[number];
   parcel?: object;
   title?: object;
@@ -234,8 +229,6 @@ type SectionInput = {
   buildability?: object;
   restrictions?: object;
   valuation?: object;
-  risks?: unknown[];
-  openItems?: unknown[];
 };
 
 export function buildDueDiligenceBody(
@@ -243,14 +236,14 @@ export function buildDueDiligenceBody(
   fields: SectionInput,
 ): { ok: true; body: Record<string, unknown> } | { ok: false; error: ToolError } {
   const body: Record<string, unknown> = { ...identity };
+  if (fields.expectedRevision !== undefined) body.expectedRevision = fields.expectedRevision;
   if (fields.status) body.status = fields.status;
   for (const key of ["parcel", "title", "values", "access", "buildability", "restrictions", "valuation"] as const) {
-    const value = compactSection(fields[key]);
-    if (value) body[key] = value;
+    const value = compactSection(fields[key], MONEY_FIELDS[key]);
+    if (!value.ok) return value;
+    if (value.section) body[key] = value.section;
   }
-  if (fields.risks) body.risks = fields.risks;
-  if (fields.openItems) body.openItems = fields.openItems;
-  if (!Object.keys(body).some((key) => !IDENTITY_KEYS.has(key))) {
+  if (!Object.keys(body).some((key) => !NON_CONTENT_KEYS.has(key))) {
     return {
       ok: false,
       error: {
@@ -269,21 +262,21 @@ export function buildCompBody(
   comp: {
     address: string;
     acres?: number;
-    price?: number;
+    price?: number | string;
     date?: string;
     status?: (typeof COMP_STATUS)[number];
     url?: string;
   },
+  expectedRevision?: number,
 ): { ok: true; body: Record<string, unknown> } | { ok: false; error: ToolError } {
-  const body: Record<string, unknown> = {
-    ...identity,
-    address: comp.address,
-  };
-  if (comp.acres !== undefined) body.acres = comp.acres;
-  if (comp.price !== undefined) body.price = comp.price;
-  if (comp.date) body.date = comp.date;
-  if (comp.status) body.status = comp.status;
-  if (comp.url) body.url = comp.url;
+  const entry: Record<string, unknown> = { address: comp.address };
+  if (comp.acres !== undefined) entry.acres = comp.acres;
+  if (comp.price !== undefined) entry.price = formatAmount(comp.price);
+  if (comp.date) entry.date = comp.date;
+  if (comp.status) entry.status = comp.status;
+  if (comp.url) entry.url = comp.url;
+  const body: Record<string, unknown> = { ...identity, comps: { add: [entry] } };
+  if (expectedRevision !== undefined) body.expectedRevision = expectedRevision;
   const tooLarge = payloadTooLarge(body);
   if (tooLarge) return { ok: false, error: tooLarge };
   return { ok: true, body };
@@ -292,28 +285,64 @@ export function buildCompBody(
 export function buildItemBody(
   identity: Record<string, string>,
   item: {
+    itemId: string;
     kind?: (typeof ITEM_KIND)[number];
     status: (typeof ITEM_STATUS)[number];
     text?: string;
     sourceUrl?: string;
   },
+  expectedRevision?: number,
 ): { ok: true; body: Record<string, unknown> } | { ok: false; error: ToolError } {
-  const body: Record<string, unknown> = { ...identity, status: item.status };
-  if (item.kind) body.kind = item.kind;
-  if (item.text) body.text = item.text;
-  if (item.sourceUrl) body.sourceUrl = item.sourceUrl;
+  const entry: Record<string, unknown> = { itemId: item.itemId, status: item.status };
+  if (item.kind) entry.kind = item.kind;
+  if (item.text) entry.text = item.text;
+  if (item.sourceUrl) entry.sourceUrl = item.sourceUrl;
+  const body: Record<string, unknown> = { ...identity, items: { update: [entry] } };
+  if (expectedRevision !== undefined) body.expectedRevision = expectedRevision;
   const tooLarge = payloadTooLarge(body);
   if (tooLarge) return { ok: false, error: tooLarge };
   return { ok: true, body };
 }
 
-function compactSection(value: object | undefined): Record<string, unknown> | undefined {
-  if (!value) return undefined;
+export function dueDiligenceConflict(error: unknown): ToolError | undefined {
+  if (!(error instanceof ApiError)) return undefined;
+  if (error.status !== 409 && error.code !== "DD_CONFLICT") return undefined;
+  const apiMessage = readApiMessage(error.body);
+  const message = apiMessage
+    ? `Due diligence conflict: ${apiMessage} Read the record again with get_due_diligence and retry with its current revision as expectedRevision.`
+    : "Due diligence changed since expectedRevision. Read the record again with get_due_diligence and retry with its current revision as expectedRevision.";
+  return {
+    error: "DD_CONFLICT",
+    message,
+    status: error.status,
+    details: error.body,
+  };
+}
+
+function compactSection(
+  value: object | undefined,
+  moneyKeys: readonly string[] | undefined,
+): { ok: true; section?: Record<string, unknown> } | { ok: false; error: ToolError } {
+  if (!value) return { ok: true };
+  const money = new Set(moneyKeys ?? []);
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) {
-    if (entry !== undefined) out[key] = entry;
+    if (entry === undefined) continue;
+    if (money.has(key)) {
+      try {
+        out[key] = formatAmount(entry);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        return {
+          ok: false,
+          error: { error: "AMOUNT_INVALID", message: `${key}: ${reason}` },
+        };
+      }
+      continue;
+    }
+    out[key] = entry;
   }
-  return Object.keys(out).length > 0 ? out : undefined;
+  return { ok: true, section: Object.keys(out).length > 0 ? out : undefined };
 }
 
 function payloadTooLarge(body: Record<string, unknown>): ToolError | undefined {
@@ -323,4 +352,16 @@ function payloadTooLarge(body: Record<string, unknown>): ToolError | undefined {
     error: "DUE_DILIGENCE_TOO_LARGE",
     message: `Due diligence payload is ${size} characters, and the limit is ${MAX_DUE_DILIGENCE_JSON_CHARS}.`,
   };
+}
+
+function readApiMessage(body: unknown): string | undefined {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const record = body as Record<string, unknown>;
+  if (typeof record.message === "string" && record.message.trim()) return record.message.trim();
+  const nested = record.error;
+  if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+    const message = (nested as Record<string, unknown>).message;
+    if (typeof message === "string" && message.trim()) return message.trim();
+  }
+  return undefined;
 }

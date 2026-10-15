@@ -61,13 +61,13 @@ Omit `organizationId` on those searches to cover every membership. A cross-org k
 | `search_properties` | Same, including parcels with no lead. `searchBy` adds `refId`. |
 | `list_campaigns` | Searches every company. Optional `query` and `organizationId`. |
 | `get_lead`, `get_campaign`, `list_lead_images` | Find the record in either company unless `organizationId` is set. |
-| `list_leads`, `list_properties`, `list_tasks`, `get_kpis`, analytics tools | Still one company (home company unless `organizationId` is set). `list_leads` and `search_leads` also take `ddStatus`, `valueMin`, and `valueMax`. |
-| `get_due_diligence` | Reads the structured due diligence section for a lead (every parcel, or one APN / property) or for a parcel with no lead. |
+| `list_leads`, `list_properties`, `list_tasks`, `get_kpis`, analytics tools | Still one company (home company unless `organizationId` is set). |
+| `get_due_diligence` | Reads the structured due diligence section for a lead or for a parcel with no lead. |
 | `create_lead`, `update_lead`, `delete_lead`, `add_contact_note` | Take `organizationId` and send it. |
 | `update_property_enrichment` | Sets `enrichmentMarkdown` on a property and stamps `enrichedAt`. Takes `propertyId` and `organizationId`. |
-| `upsert_due_diligence` | Partial update of one parcel's due diligence. Takes `leadId` and/or `propertyId`, plus `apn` when a lead has several parcels. |
-| `add_dd_comp` | Appends one sold or active comparable. |
-| `update_dd_item` | Updates one risk or open item (`OPEN`, `VERIFIED`, or `NA`). |
+| `upsert_due_diligence` | Partial update of one parcel's due diligence. `propertyId` or `parcelApn` selects the parcel on a lead and is optional when that lead has one parcel. |
+| `add_dd_comp` | Appends one sold or active comparable with `comps.add` on the same PATCH. |
+| `update_dd_item` | Updates one risk or open item with `items.update` on the same PATCH. |
 | `upload_lead_image`, `delete_lead_image` | Take `organizationId` and send it. |
 | `create_campaign` | Imports a local CSV or XLSX property file. Requires `name`, a unique `refId` prefix, and `filePath`; sends a multipart upload to the given company. |
 | `edit_campaign`, `delete_campaign` | Take `organizationId` and send it. |
@@ -118,50 +118,37 @@ The `landbridge://organization` resource is still the key's home company.
 
 ## Due diligence
 
-Due diligence is a structured record per parcel, not a contact note. A lead can own several parcels, so `leadId` plus `apn` or `propertyId` picks the record. A parcel with no lead uses `propertyId` alone.
+Due diligence is a structured record per parcel, not a contact note. The wire contract matches [land-tools-api #40](https://github.com/s10mcow/land-tools-api/pull/40). There is one read and one write route per lead or property. Comps and items are patches on that same route, not separate paths.
 
 ```json
 {
   "leadId": "lead-id-from-search",
   "propertyId": "property-id-from-the-lead",
-  "apn": "12-34-567",
+  "parcelApn": "12-34-567",
+  "expectedRevision": 3,
   "status": "IN_PROGRESS",
-  "title": { "ownerOfRecord": "Ada Lovelace", "sellerRelation": "OWNER" },
-  "valuation": { "offerTarget": 18000 },
+  "title": { "ownerOfRecord": "Ada Lovelace", "seller": "OWNER", "deedPrice": "15000.50" },
+  "valuation": { "offerTarget": "18000.00" },
   "organizationId": "company-id-from-the-search-hit"
 }
 ```
 
-`get_due_diligence` checks every company unless `organizationId` is set, the same way `get_lead` does. The write tools follow `update_property_enrichment`: a cross-org key must pass `organizationId` or the tool returns `ORGANIZATION_REQUIRED` and does not call the API. A single-org key may omit it. Ids in the path are `encodeURIComponent`'d. Text fields are capped (2,000 characters for short fields, 20,000 for legal description, covenants, rationale, and item text), lists hold at most 50 items, and the JSON body must stay within 100,000 characters.
+`get_due_diligence` checks every company unless `organizationId` is set, the same way `get_lead` does. The write tools follow `update_property_enrichment`: a cross-org key must pass `organizationId` or the tool returns `ORGANIZATION_REQUIRED` and does not call the API. A single-org key may omit it. Ids in the path are `encodeURIComponent`'d. Text fields are capped (2,000 characters for short fields, 20,000 for legal description, covenants, rationale, and item text), and the JSON body must stay within 100,000 characters.
 
 | Tool | Request |
 | --- | --- |
-| `get_due_diligence` | `GET /leads/{leadId}/due-diligence` or `GET /properties/{propertyId}/due-diligence`. `apn` and `propertyId` are query filters on the lead route. |
-| `upsert_due_diligence` | `PATCH` on that same path. Body is only the identity (`apn`, and `propertyId` when the path is the lead) plus the sections you set. |
-| `add_dd_comp` | `POST .../due-diligence/comps` with `address`, `acres`, `price`, `date`, `status` (`SOLD` or `ACTIVE`), and `url`. |
-| `update_dd_item` | `PATCH .../due-diligence/items/{itemId}` with `status` (`OPEN`, `VERIFIED`, `NA`), optional `kind` (`risk` or `open_item`), `text`, and `sourceUrl`. |
-| `list_leads`, `search_leads` | Optional `ddStatus`, `valueMin`, and `valueMax` query params. |
+| `get_due_diligence` | `GET /leads/{leadId}/due-diligence` or `GET /properties/{propertyId}/due-diligence`. On the lead route, `parcelApn` and `propertyId` are optional query selectors. |
+| `upsert_due_diligence` | `PATCH` on that same path. Body is the selectors plus only the sections you set. |
+| `add_dd_comp` | `PATCH` on that same path with `comps: { add: [{ address, acres, price, date, status, url }] }`. |
+| `update_dd_item` | `PATCH` on that same path with `items: { update: [{ itemId, kind, status, text, sourceUrl }] }`. |
 
-`PATCH` is partial. Omitted sections stay as they are. Inside a section, omitted keys stay as they are. `risks` and `openItems`, when sent, replace that list. Comps are not on the PATCH; `add_dd_comp` appends one. `update_dd_item` changes one item, and creates it when that id is new (`text` is required on create).
+On a lead, `propertyId` or `parcelApn` selects the parcel. Leave both off when the lead has one parcel. A parcel with no lead uses the property route, and those selectors stay out of the body. `expectedRevision` is the revision from the last read. When it is stale the API returns 409 `DD_CONFLICT`; the tool returns that code, the API body, and tells you to read again and retry. It does not hide the conflict as a generic request failure.
 
-`status` on a parcel is `NOT_STARTED`, `IN_PROGRESS`, `COMPLETE`, or `PASS`. Other enums: road `PAVED` / `GRAVEL` / `DIRT` / `NONE`; maintenance `COUNTY` / `PRIVATE`; trustee `PAID` / `DELINQUENT`; seller relation `OWNER` / `SPOUSE` / `HEIR` / `ENTITY` / `OTHER`.
+`PATCH` is partial. Omitted sections stay as they are. Inside a section, omitted keys stay as they are. Amounts (`deedPrice`, land and assessed value, `taxAmount`, dues, market and offer values, and comp `price`) are sent as 2-decimal strings such as `"15000.50"`. Dates (`deedDate`, comp `date`) are `YYYY-MM-DD`.
 
-`list_leads` and `search_leads` forward `ddStatus` and an inclusive `valueMin` / `valueMax` range. The range compares `valuation.marketValueHigh`, then `valuation.marketValueLow` when the high is unset. A reversed range returns `VALUE_RANGE_INVALID` and does not call the API.
+Nested groups are `parcel`, `title`, `values`, `access`, `buildability`, `restrictions`, and `valuation`. Enums: status `NOT_STARTED` / `IN_PROGRESS` / `COMPLETE` / `PASS`; `title.seller` `OWNER` / `SPOUSE` / `HEIR` / `ENTITY` / `OTHER`; `access.road` `PAVED` / `GRAVEL` / `DIRT` / `NONE`; `access.maintenance` `COUNTY` / `PRIVATE`; `values.trustee` `PAID` / `DELINQUENT`; comp status `SOLD` / `ACTIVE`; item `kind` `RISK` / `OPEN_ITEM`; item status `OPEN` / `VERIFIED` / `NA`.
 
-### Assumed API contract
-
-`s10mcow/land-tools-api` was not readable with this token (`repository not found`), and no due-diligence pull request was visible. These routes are not mounted on the public API behind [landbridge.app](https://www.landbridge.app) yet: `PATCH /properties/{id}/enrichment` returns 401 `NO_TOKEN` without a bearer token, while `GET` and `PATCH` of `/leads/{id}/due-diligence` and `/properties/{id}/due-diligence` return 500, the same response unknown paths return. The MCP server calls the paths below with `X-API-Key` against `MCP_API_URL`. Until `land-tools-api` serves them, the tools fail at request time.
-
-Assumptions the API handler should match:
-
-- Auth is the existing API-key middleware used by `PATCH /leads/{leadId}`. Cross-org keys send `X-Organization-Id` and, on writes, `organizationId` in the JSON body. GETs also send `organizationId` as a query parameter when it is set.
-- Load the lead or property by id inside the caller's organization. Another company's id is 404, and nothing is written.
-- A lead may have several parcel records. The lead PATCH selects the parcel by `propertyId` and/or `apn` in the body. The property routes address that parcel directly.
-- `GET` returns `{ leadId?, propertyId?, parcels: [record] }`. A known lead with no due diligence yet is 200 and `parcels: []`. Each parcel record includes the sections above, `comps`, and item `id`s.
-- `PATCH` deep-merges the sections it receives (one level of keys). It does not replace the whole record. `risks` and `openItems` replace those arrays when present.
-- `POST .../comps` appends one comp and returns the updated parcel record.
-- `PATCH .../items/{itemId}` updates that item, or creates it when the id is new. Return the updated parcel record.
-- Do not write contact notes from these routes.
+`list_leads` and `search_leads` do not take a due diligence status or value range. That contract does not include `ddStatus`, `valueMin`, or `valueMax`, so those arguments are not sent.
 
 The lead UI, and moving the existing free-text due diligence notes on leads `363ce55b-e1a1-43ec-9a97-e38962419bb6` and `be07aab4-29a8-46e5-9094-d700a6234c93` into this structure, live in the API and web app. This server only reads and writes the section.
 

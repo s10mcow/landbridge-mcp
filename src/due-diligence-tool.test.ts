@@ -123,8 +123,8 @@ test("upsert_due_diligence writes a partial parcel record for one company", asyn
         json(res, 200, CROSS_ORGS);
         return;
       }
-      if (seen.method === "PATCH" && seen.path === encodedLeadPath) {
-        json(res, 200, { leadId: "lead/1?v=2", apn: "12/34", status: "IN_PROGRESS" });
+      if (seen.method === "PATCH" && (seen.path === encodedLeadPath || seen.path === "/leads/lead_only/due-diligence")) {
+        json(res, 200, { revision: 4, status: "IN_PROGRESS" });
         return;
       }
       json(res, 500, { message: `unexpected ${seen.method} ${seen.path}` });
@@ -135,26 +135,26 @@ test("upsert_due_diligence writes a partial parcel record for one company", asyn
       assert.ok(tool);
       assert.equal(tool.inputSchema.required?.includes("organizationId") ?? false, false);
       assert.equal(tool.inputSchema.required?.includes("leadId") ?? false, false);
+      assert.equal(tool.inputSchema.required?.includes("parcelApn") ?? false, false);
       assert.equal(maxLength(findSchema(tool.inputSchema, "legalDescription")), MAX_DD_LONG_TEXT);
+      const seller = findSchema(tool.inputSchema, "seller");
+      assert.ok(seller);
+      const sellerValues = JSON.stringify(seller);
+      for (const value of ["OWNER", "SPOUSE", "HEIR", "ENTITY", "OTHER"]) {
+        assert.match(sellerValues, new RegExp(value));
+      }
 
       const refused = await client.callTool({
         name: "upsert_due_diligence",
-        arguments: { leadId: "lead/1?v=2", apn: "12/34", status: "IN_PROGRESS" },
+        arguments: { leadId: "lead/1?v=2", parcelApn: "12/34", status: "IN_PROGRESS" },
       });
       assert.equal(refused.isError, true);
       assert.equal(errorCode(refused), "ORGANIZATION_REQUIRED");
       assert.equal(calls.some((call) => call.method === "PATCH"), false);
 
-      const missingParcel = await client.callTool({
-        name: "upsert_due_diligence",
-        arguments: { leadId: "lead/1?v=2", status: "IN_PROGRESS", organizationId: "org-south" },
-      });
-      assert.equal(missingParcel.isError, true);
-      assert.equal(errorCode(missingParcel), "PARCEL_REQUIRED");
-
       const missingFields = await client.callTool({
         name: "upsert_due_diligence",
-        arguments: { leadId: "lead/1?v=2", apn: "12/34", organizationId: "org-south" },
+        arguments: { leadId: "lead/1?v=2", parcelApn: "12/34", organizationId: "org-south" },
       });
       assert.equal(missingFields.isError, true);
       assert.equal(errorCode(missingFields), "DUE_DILIGENCE_FIELDS_REQUIRED");
@@ -165,10 +165,18 @@ test("upsert_due_diligence writes a partial parcel record for one company", asyn
         arguments: {
           leadId: " lead/1?v=2 ",
           propertyId: "prop_9",
-          apn: " 12/34 ",
+          parcelApn: " 12/34 ",
+          expectedRevision: 3,
           status: "IN_PROGRESS",
           parcel: { acreage: 5.25 },
-          title: { ownerOfRecord: "Ada Lovelace" },
+          title: {
+            ownerOfRecord: "Ada Lovelace",
+            seller: "OWNER",
+            deedDate: "1998-03-02",
+            deedPrice: "15000.5",
+          },
+          values: { trustee: "PAID", taxAmount: 240 },
+          access: { road: "GRAVEL", maintenance: "COUNTY" },
           restrictions: { hoa: false, strAllowed: true },
           organizationId: "org-south",
         },
@@ -179,19 +187,41 @@ test("upsert_due_diligence writes a partial parcel record for one company", asyn
       assert.equal(patch.path, encodedLeadPath);
       assert.equal(patch.org, "org-south");
       assert.deepEqual(patch.body, {
-        apn: "12/34",
+        parcelApn: "12/34",
         propertyId: "prop_9",
+        expectedRevision: 3,
         status: "IN_PROGRESS",
         parcel: { acreage: 5.25 },
-        title: { ownerOfRecord: "Ada Lovelace" },
+        title: {
+          ownerOfRecord: "Ada Lovelace",
+          seller: "OWNER",
+          deedDate: "1998-03-02",
+          deedPrice: "15000.50",
+        },
+        values: { trustee: "PAID", taxAmount: "240.00" },
+        access: { road: "GRAVEL", maintenance: "COUNTY" },
         restrictions: { hoa: false, strAllowed: true },
+        organizationId: "org-south",
+      });
+
+      const oneParcel = await client.callTool({
+        name: "upsert_due_diligence",
+        arguments: { leadId: "lead_only", status: "PASS", expectedRevision: 0, organizationId: "org-south" },
+      });
+      assert.equal(oneParcel.isError, undefined);
+      const solo = calls.filter((call) => call.method === "PATCH").at(-1);
+      assert.ok(solo);
+      assert.equal(solo.path, "/leads/lead_only/due-diligence");
+      assert.deepEqual(solo.body, {
+        status: "PASS",
+        expectedRevision: 0,
         organizationId: "org-south",
       });
     },
   );
 });
 
-test("upsert_due_diligence rejects oversized text and payloads before calling the API", async () => {
+test("upsert_due_diligence rejects oversized text, bad dates, and payloads before calling the API", async () => {
   await withMcp(
     (_req, res, seen) => {
       json(res, 500, { message: `unexpected ${seen.method} ${seen.path}` });
@@ -201,7 +231,7 @@ test("upsert_due_diligence rejects oversized text and payloads before calling th
         name: "upsert_due_diligence",
         arguments: {
           leadId: "lead_1",
-          apn: "12-34",
+          parcelApn: "12-34",
           parcel: { legalDescription: "a".repeat(MAX_DD_LONG_TEXT + 1) },
           organizationId: "org-south",
         },
@@ -209,12 +239,33 @@ test("upsert_due_diligence rejects oversized text and payloads before calling th
       assert.equal(tooLong.isError, true);
       assert.match(textOf(tooLong), new RegExp(`${MAX_DD_LONG_TEXT}|too_big|max`, "i"));
 
+      const badDate = await client.callTool({
+        name: "upsert_due_diligence",
+        arguments: {
+          leadId: "lead_1",
+          title: { deedDate: "03/02/1998" },
+          organizationId: "org-south",
+        },
+      });
+      assert.equal(badDate.isError, true);
+      assert.match(textOf(badDate), /YYYY-MM-DD|invalid|date/i);
+
+      const impossible = await client.callTool({
+        name: "upsert_due_diligence",
+        arguments: {
+          leadId: "lead_1",
+          title: { deedDate: "2024-02-31" },
+          organizationId: "org-south",
+        },
+      });
+      assert.equal(impossible.isError, true);
+
       const long = "b".repeat(MAX_DD_LONG_TEXT);
       const tooBig = await client.callTool({
         name: "upsert_due_diligence",
         arguments: {
           leadId: "lead_1",
-          apn: "12-34",
+          parcelApn: "12-34",
           parcel: { legalDescription: long },
           title: { authorityNotes: long },
           access: { notes: long },
@@ -227,6 +278,46 @@ test("upsert_due_diligence rejects oversized text and payloads before calling th
       assert.equal(errorCode(tooBig), "DUE_DILIGENCE_TOO_LARGE");
       assert.match(textOf(tooBig), new RegExp(String(MAX_DUE_DILIGENCE_JSON_CHARS)));
       assert.equal(calls.length, 0);
+    },
+  );
+});
+
+test("a stale expectedRevision surfaces 409 DD_CONFLICT", async () => {
+  await withMcp(
+    (_req, res, seen) => {
+      if (seen.path === "/cross-org/organizations") {
+        json(res, 200, CROSS_ORGS);
+        return;
+      }
+      if (seen.method === "PATCH" && seen.path === "/leads/lead_1/due-diligence") {
+        json(res, 409, { code: "DD_CONFLICT", message: "stale revision", revision: 8 });
+        return;
+      }
+      json(res, 500, { message: `unexpected ${seen.method} ${seen.path}` });
+    },
+    async (client) => {
+      const result = await client.callTool({
+        name: "upsert_due_diligence",
+        arguments: {
+          leadId: "lead_1",
+          status: "IN_PROGRESS",
+          expectedRevision: 3,
+          organizationId: "org-south",
+        },
+      });
+      assert.equal(result.isError, true);
+      const body = JSON.parse(textOf(result)) as {
+        error: string;
+        message: string;
+        status: number;
+        details: { revision: number; message: string };
+      };
+      assert.equal(body.error, "DD_CONFLICT");
+      assert.equal(body.status, 409);
+      assert.match(body.message, /expectedRevision/);
+      assert.match(body.message, /stale revision/);
+      assert.equal(body.details.revision, 8);
+      assert.equal(textOf(result).includes("REQUEST_FAILED"), false);
     },
   );
 });
@@ -250,7 +341,7 @@ test("a single-org key writes due diligence on the home company without an organ
     async (client, calls) => {
       const result = await client.callTool({
         name: "upsert_due_diligence",
-        arguments: { leadId: "lead_home", apn: "9", status: "COMPLETE" },
+        arguments: { leadId: "lead_home", parcelApn: "9", status: "COMPLETE" },
       });
       assert.equal(result.isError, undefined);
       const patch = calls.find((call) => call.method === "PATCH");
@@ -258,8 +349,9 @@ test("a single-org key writes due diligence on the home company without an organ
       assert.equal(patch.org, undefined);
       const body = patch.body as Record<string, unknown>;
       assert.equal(body.status, "COMPLETE");
-      assert.equal(body.apn, "9");
+      assert.equal(body.parcelApn, "9");
       assert.equal("organizationId" in body, false);
+      assert.equal("expectedRevision" in body, false);
 
       const missing = await client.callTool({
         name: "upsert_due_diligence",
@@ -319,7 +411,7 @@ test("get_due_diligence encodes ids and can check every company", async () => {
         return;
       }
       if (seen.path.startsWith("/leads/lead%2F1%3Fv%3D2/due-diligence")) {
-        json(res, 200, { leadId: "lead/1?v=2", parcels: [{ apn: "12/34", status: "IN_PROGRESS" }] });
+        json(res, 200, { leadId: "lead/1?v=2", parcels: [{ parcelApn: "12/34", status: "IN_PROGRESS" }] });
         return;
       }
       if (seen.path.startsWith("/properties/prop%2F2/due-diligence")) {
@@ -329,7 +421,7 @@ test("get_due_diligence encodes ids and can check every company", async () => {
       if (seen.path.startsWith("/leads/missing/due-diligence")) {
         json(res, seen.org === "org-south" ? 200 : 404, {
           ...(seen.org === "org-south"
-            ? { parcels: [{ apn: "1" }] }
+            ? { parcels: [{ parcelApn: "1" }] }
             : { message: "Lead not found", code: "NOT_FOUND" }),
         });
         return;
@@ -343,7 +435,7 @@ test("get_due_diligence encodes ids and can check every company", async () => {
     async (client, calls) => {
       const one = await client.callTool({
         name: "get_due_diligence",
-        arguments: { leadId: " lead/1?v=2 ", apn: "12/34", organizationId: "org-south" },
+        arguments: { leadId: " lead/1?v=2 ", parcelApn: "12/34", organizationId: "org-south" },
       });
       assert.equal(one.isError, undefined);
       const leadGet = calls.find((call) => call.path.startsWith("/leads/lead%2F1"));
@@ -351,10 +443,10 @@ test("get_due_diligence encodes ids and can check every company", async () => {
       assert.equal(leadGet.method, "GET");
       assert.equal(leadGet.org, "org-south");
       assert.match(leadGet.path, /^\/leads\/lead%2F1%3Fv%3D2\/due-diligence\?/);
-      assert.match(leadGet.path, /apn=12%2F34/);
+      assert.match(leadGet.path, /parcelApn=12%2F34/);
       assert.match(leadGet.path, /organizationId=org-south/);
-      const leadBody = JSON.parse(textOf(one)) as { parcels: Array<{ apn: string }> };
-      assert.equal(leadBody.parcels[0].apn, "12/34");
+      const leadBody = JSON.parse(textOf(one)) as { parcels: Array<{ parcelApn: string }> };
+      assert.equal(leadBody.parcels[0].parcelApn, "12/34");
 
       const parcel = await client.callTool({
         name: "get_due_diligence",
@@ -397,21 +489,20 @@ test("get_due_diligence encodes ids and can check every company", async () => {
   );
 });
 
-test("add_dd_comp and update_dd_item encode ids and send only the comp or item", async () => {
-  const compsPath = "/leads/lead%2F1/due-diligence/comps";
-  const itemPath = "/leads/lead_1/due-diligence/items/item%2F9%3Fx%3D1";
+test("add_dd_comp and update_dd_item patch the due diligence record", async () => {
+  const leadPath = "/leads/lead%2F1/due-diligence";
   await withMcp(
     (_req, res, seen) => {
       if (seen.path === "/cross-org/organizations") {
         json(res, 200, CROSS_ORGS);
         return;
       }
-      if (seen.method === "POST" && seen.path === compsPath) {
-        json(res, 200, { comps: [{ address: "100 County Road" }] });
+      if (seen.method === "PATCH" && seen.path === leadPath) {
+        json(res, 200, { revision: 5 });
         return;
       }
-      if (seen.method === "PATCH" && seen.path === itemPath) {
-        json(res, 200, { openItems: [{ id: "item/9?x=1", status: "VERIFIED" }] });
+      if (seen.method === "PATCH" && seen.path === "/leads/lead_1/due-diligence") {
+        json(res, 200, { revision: 6 });
         return;
       }
       json(res, 500, { message: `unexpected ${seen.method} ${seen.path}` });
@@ -427,13 +518,17 @@ test("add_dd_comp and update_dd_item encode ids and send only the comp or item",
       for (const field of ["itemId", "status"]) {
         assert.ok(itemTool.inputSchema.required?.includes(field));
       }
+      const kind = JSON.stringify(findSchema(itemTool.inputSchema, "kind"));
+      assert.match(kind, /RISK/);
+      assert.match(kind, /OPEN_ITEM/);
 
       const comp = await client.callTool({
         name: "add_dd_comp",
         arguments: {
           leadId: "lead/1",
           propertyId: "prop_9",
-          apn: "12/34",
+          parcelApn: "12/34",
+          expectedRevision: 4,
           address: "100 County Road",
           acres: 5,
           price: 25000,
@@ -444,19 +539,26 @@ test("add_dd_comp and update_dd_item encode ids and send only the comp or item",
         },
       });
       assert.equal(comp.isError, undefined);
-      const post = calls.find((call) => call.method === "POST");
-      assert.ok(post);
-      assert.equal(post.path, compsPath);
-      assert.equal(post.org, "org-south");
-      assert.deepEqual(post.body, {
-        apn: "12/34",
+      const compPatch = calls.find((call) => call.method === "PATCH" && call.path === leadPath);
+      assert.ok(compPatch);
+      assert.equal(compPatch.org, "org-south");
+      assert.equal(calls.some((call) => call.path.endsWith("/comps")), false);
+      assert.deepEqual(compPatch.body, {
+        parcelApn: "12/34",
         propertyId: "prop_9",
-        address: "100 County Road",
-        acres: 5,
-        price: 25000,
-        date: "2024-06-01",
-        status: "SOLD",
-        url: "https://example.com/comp",
+        expectedRevision: 4,
+        comps: {
+          add: [
+            {
+              address: "100 County Road",
+              acres: 5,
+              price: "25000.00",
+              date: "2024-06-01",
+              status: "SOLD",
+              url: "https://example.com/comp",
+            },
+          ],
+        },
         organizationId: "org-south",
       });
 
@@ -464,106 +566,35 @@ test("add_dd_comp and update_dd_item encode ids and send only the comp or item",
         name: "update_dd_item",
         arguments: {
           leadId: "lead_1",
-          apn: "12/34",
+          parcelApn: "12/34",
           itemId: " item/9?x=1 ",
-          kind: "open_item",
+          kind: "OPEN_ITEM",
           status: "VERIFIED",
           sourceUrl: "https://example.com/deed",
+          expectedRevision: 5,
           organizationId: "org-south",
         },
       });
       assert.equal(item.isError, undefined);
-      const patch = calls.find((call) => call.method === "PATCH");
-      assert.ok(patch);
-      assert.equal(patch.path, itemPath);
-      assert.equal(patch.org, "org-south");
-      assert.deepEqual(patch.body, {
-        apn: "12/34",
-        kind: "open_item",
-        status: "VERIFIED",
-        sourceUrl: "https://example.com/deed",
+      const itemPatch = calls.find((call) => call.method === "PATCH" && call.path === "/leads/lead_1/due-diligence");
+      assert.ok(itemPatch);
+      assert.equal(itemPatch.org, "org-south");
+      assert.equal(calls.some((call) => call.path.includes("/items/")), false);
+      assert.deepEqual(itemPatch.body, {
+        parcelApn: "12/34",
+        expectedRevision: 5,
+        items: {
+          update: [
+            {
+              itemId: "item/9?x=1",
+              kind: "OPEN_ITEM",
+              status: "VERIFIED",
+              sourceUrl: "https://example.com/deed",
+            },
+          ],
+        },
         organizationId: "org-south",
       });
-    },
-  );
-});
-
-test("list_leads and search_leads forward due diligence filters", async () => {
-  await withMcp(
-    (_req, res, seen) => {
-      if (seen.path === "/cross-org/organizations") {
-        json(res, 200, CROSS_ORGS);
-        return;
-      }
-      if (seen.method === "GET" && seen.path.startsWith("/leads?")) {
-        json(res, 200, [{ id: "lead_1" }]);
-        return;
-      }
-      if (seen.method === "GET" && seen.path.startsWith("/cross-org/leads/search")) {
-        json(res, 200, { leads: [{ id: "lead_1", name: "Ada" }] });
-        return;
-      }
-      json(res, 500, { message: `unexpected ${seen.method} ${seen.path}` });
-    },
-    async (client, calls) => {
-      const reversed = await client.callTool({
-        name: "list_leads",
-        arguments: { valueMin: 5, valueMax: 1, organizationId: "org-south" },
-      });
-      assert.equal(reversed.isError, true);
-      assert.equal(errorCode(reversed), "VALUE_RANGE_INVALID");
-
-      const searchReversed = await client.callTool({
-        name: "search_leads",
-        arguments: { query: "Ada", valueMin: 9, valueMax: 1 },
-      });
-      assert.equal(searchReversed.isError, true);
-      assert.equal(errorCode(searchReversed), "VALUE_RANGE_INVALID");
-      assert.equal(
-        calls.some((call) => call.path.startsWith("/leads") || call.path.includes("/search")),
-        false,
-      );
-
-      const listed = await client.callTool({
-        name: "list_leads",
-        arguments: {
-          ddStatus: "IN_PROGRESS",
-          valueMin: 10000,
-          valueMax: 50000,
-          organizationId: "org-south",
-        },
-      });
-      assert.equal(listed.isError, undefined);
-      const list = calls.find((call) => call.path.startsWith("/leads?"));
-      assert.ok(list);
-      assert.equal(list.org, "org-south");
-      assert.match(list.path, /ddStatus=IN_PROGRESS/);
-      assert.match(list.path, /valueMin=10000/);
-      assert.match(list.path, /valueMax=50000/);
-      assert.match(list.path, /organizationId=org-south/);
-
-      const searched = await client.callTool({
-        name: "search_leads",
-        arguments: { query: "Ada", ddStatus: "COMPLETE", valueMin: 0, valueMax: 20, organizationId: "org-north" },
-      });
-      assert.equal(searched.isError, undefined);
-      const search = calls.find((call) => call.path.startsWith("/cross-org/leads/search"));
-      assert.ok(search);
-      assert.equal(search.org, "org-north");
-      assert.match(search.path, /query=Ada/);
-      assert.match(search.path, /ddStatus=COMPLETE/);
-      assert.match(search.path, /valueMin=0/);
-      assert.match(search.path, /valueMax=20/);
-
-      await client.callTool({
-        name: "search_leads",
-        arguments: { query: "Grace" },
-      });
-      const plain = calls.find((call) => call.path.startsWith("/cross-org/leads/search") && call.path.includes("Grace"));
-      assert.ok(plain);
-      assert.equal(plain.path.includes("ddStatus"), false);
-      assert.equal(plain.path.includes("valueMin"), false);
-      assert.equal(plain.path.includes("valueMax"), false);
     },
   );
 });
