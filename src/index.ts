@@ -5,11 +5,27 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { existsSync } from "node:fs";
 import { z } from "zod";
 import { createApiClientFromEnv } from "./api-client.js";
+import {
+  COMP_STATUS,
+  ITEM_KIND,
+  ITEM_STATUS,
+  MAX_DD_LONG_TEXT,
+  MAX_DD_SHORT_TEXT,
+  MAX_DD_URL,
+  buildCompBody,
+  buildDueDiligenceBody,
+  buildItemBody,
+  dateInput,
+  dueDiligenceConflict,
+  dueDiligenceReadPath,
+  dueDiligenceSections,
+  resolveDueDiligenceTarget,
+} from "./due-diligence.js";
 import { createMultiOrg, type AcrossOrgsResult, type MutateResult } from "./multi-org.js";
 
 const server = new McpServer({
   name: "landbridge",
-  version: "0.2.1",
+  version: "0.3.1",
 });
 
 const api = createApiClientFromEnv();
@@ -143,8 +159,34 @@ server.tool(
 );
 
 server.tool(
+  "get_due_diligence",
+  "Read structured due diligence for a lead or a parcel. A lead has one record per parcel. Pass leadId for every parcel on that lead, and parcelApn or propertyId to ask for one parcel. Pass only propertyId for a parcel that has no lead. Checks every company this key belongs to unless organizationId is set. Use the returned revision as expectedRevision on the next write.",
+  {
+    leadId: z.string().trim().min(1).optional().describe("The lead ID"),
+    propertyId: z.string().trim().min(1).optional().describe("The property ID. Use this when the parcel has no lead."),
+    parcelApn: z
+      .string()
+      .trim()
+      .min(1)
+      .max(MAX_DD_SHORT_TEXT)
+      .optional()
+      .describe("Parcel APN. With leadId, sent as parcelApn to select that parcel."),
+    organizationId: lookupOrg,
+  },
+  async ({ leadId, propertyId, parcelApn, organizationId }) =>
+    run(async () => {
+      const target = dueDiligenceReadPath({ leadId, propertyId, parcelApn });
+      if (!target.ok) return fail(target.error);
+      return oneOrMany(
+        "Due diligence",
+        await lb.readAcrossOrganizations(target.path, organizationId),
+      );
+    }),
+);
+
+server.tool(
   "search_leads",
-  "Search leads across every company by name, address, APN, phone, or property ref id. Omit organizationId to cover all companies. Each hit includes organizationName, organizationId, and organizationLabel. Pass that organizationId to create_lead, update_lead, or add_contact_note.",
+  "Search leads across every company by name, address, APN, phone, or property ref id. Omit organizationId to cover all companies. Each hit includes organizationName, organizationId, and organizationLabel. Pass that organizationId to create_lead, update_lead, add_contact_note, or the due diligence tools.",
   {
     query: z.string().describe("Search term"),
     searchBy: z
@@ -327,6 +369,160 @@ server.tool(
         }),
       ),
     ),
+);
+
+const ddTarget = {
+  leadId: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
+    .describe("The lead ID. Required unless propertyId is set."),
+  propertyId: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
+    .describe(
+      "Property id. On a lead, selects the parcel. Optional when that lead has one parcel. On its own, addresses a parcel with no lead.",
+    ),
+  parcelApn: z
+    .string()
+    .trim()
+    .min(1)
+    .max(MAX_DD_SHORT_TEXT)
+    .optional()
+    .describe("Parcel APN. On a lead, selects the parcel. Optional when that lead has one parcel."),
+};
+
+const ddRevision = {
+  expectedRevision: dueDiligenceSections.expectedRevision,
+};
+
+async function writeDueDiligence(args: {
+  path: string;
+  organizationId?: string;
+  body: Record<string, unknown>;
+}): Promise<ToolResult> {
+  try {
+    return fromMutate(
+      await lb.mutate({
+        method: "PATCH",
+        path: args.path,
+        organizationId: args.organizationId,
+        body: args.body,
+      }),
+    );
+  } catch (error) {
+    const conflict = dueDiligenceConflict(error);
+    if (conflict) return fail(conflict);
+    throw error;
+  }
+}
+
+server.tool(
+  "upsert_due_diligence",
+  "Create or partially update due diligence for one parcel. Only fields you pass are sent; every other field stays as it is. On a lead, propertyId or parcelApn selects the parcel and both are optional when the lead has one parcel. Pass expectedRevision from the last read; a stale revision returns DD_CONFLICT. Amounts are sent as 2-decimal strings and dates as YYYY-MM-DD. Pass organizationId from the lead or property search hit. Use add_dd_comp to append a comparable and update_dd_item to check off one risk or open item.",
+  {
+    ...ddTarget,
+    ...dueDiligenceSections,
+    organizationId: writeOrg,
+  },
+  async ({ leadId, propertyId, parcelApn, organizationId, ...fields }) =>
+    run(async () => {
+      const target = resolveDueDiligenceTarget({ leadId, propertyId, parcelApn });
+      if (!target.ok) return fail(target.error);
+      const built = buildDueDiligenceBody(target.identity, fields);
+      if (!built.ok) return fail(built.error);
+      return writeDueDiligence({ path: target.path, organizationId, body: built.body });
+    }),
+);
+
+server.tool(
+  "add_dd_comp",
+  "Append one sold or active comparable by PATCHing the parcel due diligence record with comps.add. Does not replace comps already stored. On a lead, propertyId or parcelApn selects the parcel and both are optional when the lead has one parcel. Pass expectedRevision from the last read. Price is sent as a 2-decimal string and date as YYYY-MM-DD. Pass organizationId from the lead or property.",
+  {
+    ...ddTarget,
+    ...ddRevision,
+    address: z.string().trim().min(1).max(MAX_DD_SHORT_TEXT).describe("Comparable property address"),
+    acres: z.number().finite().nonnegative().optional(),
+    price: z
+      .union([z.number().finite().nonnegative(), z.string().trim().regex(/^(?:\d+|\d+\.\d{1,2})$/)])
+      .optional()
+      .describe("Sale or list price. Sent as a 2-decimal string."),
+    date: dateInput().optional().describe("Sale or list date as YYYY-MM-DD."),
+    status: z.enum(COMP_STATUS).optional().describe("SOLD or ACTIVE."),
+    url: z.string().trim().min(1).max(MAX_DD_URL).optional().describe("Listing or record URL"),
+    organizationId: writeOrg,
+  },
+  async ({
+    leadId,
+    propertyId,
+    parcelApn,
+    expectedRevision,
+    organizationId,
+    address,
+    acres,
+    price,
+    date,
+    status,
+    url,
+  }) =>
+    run(async () => {
+      const target = resolveDueDiligenceTarget({ leadId, propertyId, parcelApn });
+      if (!target.ok) return fail(target.error);
+      const built = buildCompBody(
+        target.identity,
+        { address, acres, price, date, status, url },
+        expectedRevision,
+      );
+      if (!built.ok) return fail(built.error);
+      return writeDueDiligence({ path: target.path, organizationId, body: built.body });
+    }),
+);
+
+server.tool(
+  "update_dd_item",
+  "Update one due diligence risk or open item by PATCHing the parcel due diligence record with items.update. itemId comes from get_due_diligence. kind is RISK or OPEN_ITEM. status is OPEN, VERIFIED, or NA. Pass expectedRevision from the last read. Pass organizationId from the lead or property.",
+  {
+    ...ddTarget,
+    ...ddRevision,
+    itemId: z.string().trim().min(1).max(200).describe("Risk or open-item id"),
+    kind: z.enum(ITEM_KIND).optional().describe("RISK or OPEN_ITEM."),
+    status: z.enum(ITEM_STATUS).describe("OPEN, VERIFIED, or NA (n/a)."),
+    text: z
+      .string()
+      .trim()
+      .min(1)
+      .max(MAX_DD_LONG_TEXT)
+      .optional()
+      .describe("Item text."),
+    sourceUrl: z.string().trim().min(1).max(MAX_DD_URL).optional().describe("Page or document that supports this item."),
+    organizationId: writeOrg,
+  },
+  async ({
+    leadId,
+    propertyId,
+    parcelApn,
+    expectedRevision,
+    itemId,
+    kind,
+    status,
+    text,
+    sourceUrl,
+    organizationId,
+  }) =>
+    run(async () => {
+      const target = resolveDueDiligenceTarget({ leadId, propertyId, parcelApn });
+      if (!target.ok) return fail(target.error);
+      const built = buildItemBody(
+        target.identity,
+        { itemId, kind, status, text, sourceUrl },
+        expectedRevision,
+      );
+      if (!built.ok) return fail(built.error);
+      return writeDueDiligence({ path: target.path, organizationId, body: built.body });
+    }),
 );
 
 server.tool(

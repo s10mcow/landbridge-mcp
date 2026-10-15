@@ -47,7 +47,7 @@ Market-research routes are unchanged on the API and still use the key's home com
 1. `lookup_offer_code` with the code on the mailer (`DNA-12A-506` and `dna12a506` are the same code).
 2. If that misses, `search_leads` or `search_properties` (address, APN, owner, phone, or ref id). `list_campaigns` searches campaigns the same way.
 3. Read `organizationName` / `organizationId` on the hit so you know which company it is.
-4. Pass that `organizationId` to `create_lead`, `update_lead`, `update_property_enrichment`, `add_contact_note`, `create_campaign`, or `edit_campaign`.
+4. Pass that `organizationId` to `create_lead`, `update_lead`, `update_property_enrichment`, `upsert_due_diligence`, `add_dd_comp`, `update_dd_item`, `add_contact_note`, `create_campaign`, or `edit_campaign`.
 
 Omit `organizationId` on those searches to cover every membership. A cross-org key must send `organizationId` on every write. If it is missing, the tool returns `ORGANIZATION_REQUIRED` and the company list instead of picking one.
 
@@ -62,8 +62,12 @@ Omit `organizationId` on those searches to cover every membership. A cross-org k
 | `list_campaigns` | Searches every company. Optional `query` and `organizationId`. |
 | `get_lead`, `get_campaign`, `list_lead_images` | Find the record in either company unless `organizationId` is set. |
 | `list_leads`, `list_properties`, `list_tasks`, `get_kpis`, analytics tools | Still one company (home company unless `organizationId` is set). |
+| `get_due_diligence` | Reads the structured due diligence section for a lead or for a parcel with no lead. |
 | `create_lead`, `update_lead`, `delete_lead`, `add_contact_note` | Take `organizationId` and send it. |
 | `update_property_enrichment` | Sets `enrichmentMarkdown` on a property and stamps `enrichedAt`. Takes `propertyId` and `organizationId`. |
+| `upsert_due_diligence` | Partial update of one parcel's due diligence. `propertyId` or `parcelApn` selects the parcel on a lead and is optional when that lead has one parcel. |
+| `add_dd_comp` | Appends one sold or active comparable with `comps.add` on the same PATCH. |
+| `update_dd_item` | Updates one risk or open item with `items.update` on the same PATCH. |
 | `upload_lead_image`, `delete_lead_image` | Take `organizationId` and send it. |
 | `create_campaign` | Imports a local CSV or XLSX property file. Requires `name`, a unique `refId` prefix, and `filePath`; sends a multipart upload to the given company. |
 | `edit_campaign`, `delete_campaign` | Take `organizationId` and send it. |
@@ -111,6 +115,42 @@ For `create_campaign`, pass an existing local CSV or XLSX property import file:
 The file is uploaded with its CSV/XLSX content type along with `name`, `refId`, and the organization selector.
 
 The `landbridge://organization` resource is still the key's home company.
+
+## Due diligence
+
+Due diligence is a structured record per parcel, not a contact note. The wire contract matches [land-tools-api #40](https://github.com/s10mcow/land-tools-api/pull/40). There is one read and one write route per lead or property. Comps and items are patches on that same route, not separate paths.
+
+```json
+{
+  "leadId": "lead-id-from-search",
+  "propertyId": "property-id-from-the-lead",
+  "parcelApn": "12-34-567",
+  "expectedRevision": 3,
+  "status": "IN_PROGRESS",
+  "title": { "ownerOfRecord": "Ada Lovelace", "seller": "OWNER", "deedPrice": "15000.50" },
+  "valuation": { "offerTarget": "18000.00" },
+  "organizationId": "company-id-from-the-search-hit"
+}
+```
+
+`get_due_diligence` checks every company unless `organizationId` is set, the same way `get_lead` does. The write tools follow `update_property_enrichment`: a cross-org key must pass `organizationId` or the tool returns `ORGANIZATION_REQUIRED` and does not call the API. A single-org key may omit it. Ids in the path are `encodeURIComponent`'d. Text fields are capped (2,000 characters for short fields, 20,000 for legal description, covenants, rationale, and item text), and the JSON body must stay within 100,000 characters.
+
+| Tool | Request |
+| --- | --- |
+| `get_due_diligence` | `GET /leads/{leadId}/due-diligence` or `GET /properties/{propertyId}/due-diligence`. On the lead route, `parcelApn` and `propertyId` are optional query selectors. |
+| `upsert_due_diligence` | `PATCH` on that same path. Body is the selectors plus only the sections you set. |
+| `add_dd_comp` | `PATCH` on that same path with `comps: { add: [{ address, acres, price, date, status, url }] }`. |
+| `update_dd_item` | `PATCH` on that same path with `items: { update: [{ itemId, kind, status, text, sourceUrl }] }`. |
+
+On a lead, `propertyId` or `parcelApn` selects the parcel. Leave both off when the lead has one parcel. A parcel with no lead uses the property route, and those selectors stay out of the body. `expectedRevision` is the revision from the last read. When it is stale the API returns 409 `DD_CONFLICT`; the tool returns that code, the API body, and tells you to read again and retry. It does not hide the conflict as a generic request failure.
+
+`PATCH` is partial. Omitted sections stay as they are. Inside a section, omitted keys stay as they are. Amounts (`deedPrice`, land and assessed value, `taxAmount`, dues, market and offer values, and comp `price`) are sent as 2-decimal strings such as `"15000.50"`. Dates (`deedDate`, comp `date`) are `YYYY-MM-DD`.
+
+Nested groups are `parcel`, `title`, `values`, `access`, `buildability`, `restrictions`, and `valuation`. Enums: status `NOT_STARTED` / `IN_PROGRESS` / `COMPLETE` / `PASS`; `title.seller` `OWNER` / `SPOUSE` / `HEIR` / `ENTITY` / `OTHER`; `access.road` `PAVED` / `GRAVEL` / `DIRT` / `NONE`; `access.maintenance` `COUNTY` / `PRIVATE`; `values.trustee` `PAID` / `DELINQUENT`; comp status `SOLD` / `ACTIVE`; item `kind` `RISK` / `OPEN_ITEM`; item status `OPEN` / `VERIFIED` / `NA`.
+
+`list_leads` and `search_leads` do not take a due diligence status or value range. That contract does not include `ddStatus`, `valueMin`, or `valueMax`, so those arguments are not sent.
+
+The lead UI, and moving the existing free-text due diligence notes on leads `363ce55b-e1a1-43ec-9a97-e38962419bb6` and `be07aab4-29a8-46e5-9094-d700a6234c93` into this structure, live in the API and web app. This server only reads and writes the section.
 
 ## Development
 
