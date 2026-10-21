@@ -1,4 +1,5 @@
 import { ApiError, type ApiClient, cleanOrganizationId } from "./api-client.js";
+import { applyLeadProperties, groupOwnerHits } from "./lead-properties.js";
 
 export type Organization = {
   organizationId: string;
@@ -103,7 +104,7 @@ export function createMultiOrg(api: ApiClient) {
   }
 
   async function searchLeads(params: LeadSearchParams): Promise<Record<string, unknown>> {
-    return searchCollection({
+    const finished = await searchCollection({
       crossPath: "/cross-org/leads/search",
       fallbackPath: "/leads/search",
       query: {
@@ -114,10 +115,11 @@ export function createMultiOrg(api: ApiClient) {
       organizationId: params.organizationId,
       emptyMessage: "No leads found.",
     });
+    return params.searchBy === "name" ? groupOwnerSearch(finished, "lead") : finished;
   }
 
   async function searchProperties(params: PropertySearchParams): Promise<Record<string, unknown>> {
-    return searchCollection({
+    const finished = await searchCollection({
       crossPath: "/cross-org/properties/search",
       fallbackPath: "/properties/search",
       query: {
@@ -128,6 +130,7 @@ export function createMultiOrg(api: ApiClient) {
       organizationId: params.organizationId,
       emptyMessage: "No properties found.",
     });
+    return params.searchBy === "owner" ? groupOwnerSearch(finished, "property") : finished;
   }
 
   async function listCampaigns(params: CampaignSearchParams): Promise<Record<string, unknown>> {
@@ -337,6 +340,37 @@ export function createMultiOrg(api: ApiClient) {
     }
   }
 
+  async function readLead(leadId: string, organizationId?: string): Promise<AcrossOrgsResult> {
+    const encoded = encodeURIComponent(leadId.trim());
+    const found = await readAcrossOrganizations(`/leads/${encoded}`, organizationId);
+    for (const hit of found.hits) {
+      if (!isPlainObject(hit.data)) continue;
+      const record = hit.data;
+      const orgId = cleanOrganizationId(readString(record.organizationId) || hit.organization?.organizationId);
+      const embedded = Array.isArray(record.properties);
+      let listed: unknown[] | undefined;
+      let listUnavailable = false;
+      if (!embedded) {
+        try {
+          listed = extractPropertyList(
+            await api.get(`/leads/${encoded}/properties`, { organizationId: orgId }),
+          );
+        } catch (error) {
+          if (isMissingRoute(error)) listUnavailable = true;
+          else if (error instanceof ApiError && error.status === 404) listed = [];
+          else throw error;
+        }
+      }
+      const applied = applyLeadProperties(record, listed, { listUnavailable });
+      const org = hit.organization ?? (orgId ? { organizationId: orgId, name: readString(record.organizationName) || orgId } : undefined);
+      if (Array.isArray(applied.properties)) {
+        applied.properties = applied.properties.map((item) => labelRecord(item, org));
+      }
+      hit.data = applied;
+    }
+    return found;
+  }
+
   async function read(path: string, organizationId?: string): Promise<unknown> {
     const mode = await loadMode();
     const orgId = cleanOrganizationId(organizationId);
@@ -482,6 +516,7 @@ export function createMultiOrg(api: ApiClient) {
     listCampaigns,
     lookupOfferCode,
     read,
+    readLead,
     readAcrossOrganizations,
     mutate,
     upload,
@@ -627,7 +662,28 @@ function labelRecord(record: unknown, fallback?: Organization, depth = 0): unkno
       next[key] = labelRecord(next[key], nestedFallback, depth + 1);
     }
   }
+  if (Array.isArray(next.properties)) {
+    next.properties = next.properties.map((item) => labelRecord(item, nestedFallback, depth + 1));
+  }
   return next;
+}
+
+function groupOwnerSearch(
+  finished: Record<string, unknown>,
+  kind: "lead" | "property",
+): Record<string, unknown> {
+  const results = Array.isArray(finished.results) ? finished.results : [];
+  if (results.length === 0) return finished;
+  return { ...finished, groupedBy: "owner", results: groupOwnerHits(results, kind) };
+}
+
+function extractPropertyList(data: unknown): unknown[] {
+  if (Array.isArray(data)) return data;
+  if (!isPlainObject(data)) return [];
+  for (const key of ["properties", "results", "data", "items"]) {
+    if (Array.isArray(data[key])) return data[key] as unknown[];
+  }
+  return [];
 }
 
 function campaignMatches(campaign: unknown, query: string): boolean {

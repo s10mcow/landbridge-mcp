@@ -1,6 +1,65 @@
 import { readFileSync } from "node:fs";
 import { basename, extname } from "node:path";
 
+const EXTENSION_MIME: Record<string, string> = {
+  ".csv": "text/csv",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+};
+
+/** Image types the lead-image API accepts. Magic bytes win over a misleading extension. */
+export function detectUploadMime(fileName: string, bytes: Uint8Array): string {
+  return detectImageMime(bytes) ?? EXTENSION_MIME[extname(fileName).toLowerCase()] ?? "application/octet-stream";
+}
+
+function detectImageMime(bytes: Uint8Array): string | undefined {
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    bytes.length >= 6 &&
+    bytes[0] === 0x47 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x38 &&
+    (bytes[4] === 0x37 || bytes[4] === 0x39) &&
+    bytes[5] === 0x61
+  ) {
+    return "image/gif";
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+  return undefined;
+}
+
 export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
@@ -100,18 +159,11 @@ export function createApiClient(config: ApiClientConfig): ApiClient {
     const organizationId = cleanOrganizationId(options?.organizationId);
     const fileBuffer = readFileSync(filePath);
     const fileName = basename(filePath);
+    const bytes = new Uint8Array(fileBuffer.byteLength);
+    bytes.set(fileBuffer);
+    const type = detectUploadMime(fileName, bytes);
     const formData = new FormData();
-    const mimeTypes: Record<string, string> = {
-      ".csv": "text/csv",
-      ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      ".png": "image/png",
-      ".jpg": "image/jpeg",
-      ".jpeg": "image/jpeg",
-      ".webp": "image/webp",
-      ".gif": "image/gif",
-    };
-    const type = mimeTypes[extname(fileName).toLowerCase()] ?? "application/octet-stream";
-    formData.append("file", new Blob([fileBuffer], { type }), fileName);
+    formData.append("file", new File([bytes], fileName, { type }));
     if (fields) {
       for (const [key, value] of Object.entries(fields)) {
         formData.append(key, value);

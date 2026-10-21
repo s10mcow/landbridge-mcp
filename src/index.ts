@@ -22,10 +22,11 @@ import {
   resolveDueDiligenceTarget,
 } from "./due-diligence.js";
 import { createMultiOrg, type AcrossOrgsResult, type MutateResult } from "./multi-org.js";
+import { buildAddPropertyBody } from "./lead-properties.js";
 
 const server = new McpServer({
   name: "landbridge",
-  version: "0.3.1",
+  version: "0.4.0",
 });
 
 const api = createApiClientFromEnv();
@@ -149,13 +150,13 @@ server.tool(
 
 server.tool(
   "get_lead",
-  "Get a lead by id. Checks every company this key belongs to unless organizationId is set. The result is labeled with organizationName and organizationId.",
+  "Get a lead by id, including every linked parcel. Checks every company this key belongs to unless organizationId is set. The result is labeled with organizationName and organizationId. properties lists each parcel the API returned, and pricing sums offerPrice, purchasePrice, and sellingPrice across those parcels when the API sent numbers. Pass organizationId from the lead to add_property_to_lead.",
   {
     leadId: z.string().describe("The lead ID"),
     organizationId: lookupOrg,
   },
   async ({ leadId, organizationId }) =>
-    run(async () => oneOrMany("Lead", await lb.readAcrossOrganizations(`/leads/${leadId}`, organizationId))),
+    run(async () => oneOrMany("Lead", await lb.readLead(leadId, organizationId))),
 );
 
 server.tool(
@@ -186,7 +187,7 @@ server.tool(
 
 server.tool(
   "search_leads",
-  "Search leads across every company by name, address, APN, phone, or property ref id. Omit organizationId to cover all companies. Each hit includes organizationName, organizationId, and organizationLabel. Pass that organizationId to create_lead, update_lead, add_contact_note, or the due diligence tools.",
+  "Search leads across every company by name, address, APN, phone, or property ref id. Omit organizationId to cover all companies. Each hit includes organizationName, organizationId, and organizationLabel. searchBy name sets groupedBy to owner. Each grouped result has ownerName, leadIds, the original leads, properties, and pricing summed from the parcel prices the API returned. Other searchBy values stay a flat list. Pass organizationId to create_lead, update_lead, add_property_to_lead, add_contact_note, or the due diligence tools.",
   {
     query: z.string().describe("Search term"),
     searchBy: z
@@ -247,7 +248,7 @@ server.tool(
 
 server.tool(
   "search_properties",
-  "Search parcels across every company by address, APN, owner name, or ref id, including parcels with no lead. Omit organizationId to cover all companies. Each hit includes organizationName and organizationId.",
+  "Search parcels across every company by address, APN, owner name, or ref id, including parcels with no lead. Omit organizationId to cover all companies. Each hit includes organizationName and organizationId. searchBy owner sets groupedBy to owner. Each grouped result has ownerName, leadIds, properties, and pricing for one company. The same owner in another company is a separate result. Other searchBy values stay a flat list.",
   {
     query: z.string().describe("Search term (street, APN, owner name, or ref id)"),
     searchBy: z
@@ -553,7 +554,7 @@ server.tool(
 
 server.tool(
   "create_lead",
-  "Create a lead from a property ref id in a specific company. The parcel must already be in that company. Pass organizationId from lookup_offer_code or search_properties.",
+  "Create a lead from a property ref id in a specific company. The parcel must already be in that company. Pass organizationId from lookup_offer_code or search_properties. To attach another parcel to a lead that already exists, use add_property_to_lead.",
   {
     refId: z
       .string()
@@ -567,6 +568,38 @@ server.tool(
       organizationId,
       body: { refId },
     }))),
+);
+
+server.tool(
+  "add_property_to_lead",
+  "Link another parcel to an existing lead, or create that parcel in the lead's company and link it. A seller can own more than one parcel on the same lead. Pass refId to link a parcel already in the company, or apn with county and state to find or create the parcel. offerPrice, purchasePrice, and sellingPrice are stored on that parcel. Pass organizationId from the lead. A cross-org key has to pass organizationId.",
+  {
+    leadId: z.string().trim().min(1).describe("The lead ID"),
+    refId: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .describe("Property reference id of a parcel already in the company. Dashes are optional."),
+    apn: z.string().trim().min(1).optional().describe("Parcel APN. With county and state, finds or creates the parcel."),
+    county: z.string().trim().min(1).optional().describe("County for the APN, such as Lee or Osceola."),
+    state: z.string().trim().min(1).optional().describe("State for the APN, such as FL."),
+    offerPrice: z.number().finite().nonnegative().optional().describe("Offer price for this parcel."),
+    purchasePrice: z.number().finite().nonnegative().optional().describe("Purchase price for this parcel."),
+    sellingPrice: z.number().finite().nonnegative().optional().describe("Selling price for this parcel."),
+    organizationId: writeOrg,
+  },
+  async ({ leadId, organizationId, ...fields }) =>
+    run(async () => {
+      const built = buildAddPropertyBody(fields);
+      if (!built.ok) return fail(built.error);
+      return fromMutate(await lb.mutate({
+        method: "POST",
+        path: `/leads/${encodeURIComponent(leadId)}/properties`,
+        organizationId,
+        body: built.body,
+      }));
+    }),
 );
 
 server.tool(
@@ -621,7 +654,7 @@ server.tool(
 
 server.tool(
   "upload_lead_image",
-  "Upload a screenshot or image to a lead from a local file path. Pass organizationId for the company that owns the lead.",
+  "Upload a screenshot or image to a lead from a local file path. PNG, JPEG, GIF, and WebP are detected from the file bytes, then from the extension, and uploaded with that content type. Pass organizationId for the company that owns the lead.",
   {
     leadId: z.string().describe("The lead ID"),
     filePath: z.string().describe("Absolute path to the image file on disk"),
