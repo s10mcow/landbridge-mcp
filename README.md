@@ -4,13 +4,21 @@ MCP tools for the LandBridge land-investment CRM. A landowner can call with a ma
 
 ## Setup for both companies
 
-Auth is still a single `lbapi_sk_` key. Mint one key that can act in every company your user belongs to:
+Auth is still one `lbapi_sk_` key in `MCP_API_KEY`. There is no new environment variable. `MCP_API_URL` stays optional and still defaults to `https://api.landbridge.com`.
+
+A key reaches every company it belongs to when it is minted with `crossOrg: true`. For Rising Tide and San and Stone LLC, the user who owns the key has to be a member of both, and the key looks like:
 
 ```json
 { "name": "MCP both companies", "scopes": ["*"], "crossOrg": true }
 ```
 
-Put that key in the MCP server environment:
+Every request sends that key as `X-API-Key`. Cross-company reads call `/cross-org/...` and omit `X-Organization-Id`, so both companies come back in one search. Each hit is labeled with `organizationId`, `organizationName`, and `organizationLabel`. A name that the hit omits is filled from `GET /cross-org/organizations`. Writes send `X-Organization-Id` and `organizationId` for the company they target.
+
+`list_organizations` shows the companies and the key's `crossOrg` flag. If that list already contains both Rising Tide and San and Stone LLC with `crossOrg: true`, leave `MCP_API_KEY` as it is. Restart the MCP client after rebuilding this package so it loads the new tools. If the list is only one company, or `crossOrg` is false, replace `MCP_API_KEY` with a cross-org key and restart. An older single-org key keeps working: searches stay on that key's home company, and the tool result says so.
+
+`GET /cross-org/organizations` returns `{ crossOrg, organizations: [{ organizationId, name, role }] }`. HTTP 200 also applies to single-org keys; it does not imply cross-org credentials. A cross-org key still needs a company on writes that are not tied to one existing record. When an older API omits this metadata for a single membership, the server enforces the write requirement.
+
+Market-research routes are unchanged on the API and still use the key's home company. This server does not call them.
 
 ```json
 {
@@ -27,8 +35,6 @@ Put that key in the MCP server environment:
 }
 ```
 
-`MCP_API_URL` is optional and defaults to `https://api.landbridge.com`.
-
 Build:
 
 ```bash
@@ -36,20 +42,14 @@ npm install
 npm run build
 ```
 
-Cross-company tools call `/cross-org/...` on the API. Deploy that API before using a `crossOrg` key. An older key (no `crossOrg`) keeps working, and so does a server that has no `/cross-org` routes: searches stay on the key's home company, and the tool result says so.
-
-The organization-list response includes the key's `crossOrg` flag. HTTP 200 also applies to single-org keys; it does not imply cross-org credentials. A cross-org key needs `organizationId` even if it currently has only one membership. When an older API omits this metadata for a single membership, the server enforces the write requirement.
-
-Market-research routes are unchanged on the API and still use the key's home company. This server does not call them.
-
 ## How a call should go
 
 1. `lookup_offer_code` with the code on the mailer (`DNA-12A-506` and `dna12a506` are the same code).
-2. If that misses, `search_leads` or `search_properties` (address, APN, owner, phone, or ref id). `list_campaigns` searches campaigns the same way.
+2. If that misses, `search_leads` or `search_properties` (address, APN, owner, phone, or ref id). Both search every company by default. `searchBy` `name` on leads, or `owner` on parcels, groups one seller's parcels. `get_lead` also accepts `refId` and checks every company. `list_campaigns` searches campaigns the same way.
 3. Read `organizationName` / `organizationId` on the hit so you know which company it is.
-4. Pass that `organizationId` to `create_lead`, `update_lead`, `update_property_enrichment`, `upsert_due_diligence`, `add_dd_comp`, `update_dd_item`, `add_contact_note`, `create_campaign`, or `edit_campaign`.
+4. Pass that `organizationId` to `create_lead`, `add_property_to_lead`, `update_lead`, `update_property_enrichment`, `upsert_due_diligence`, `add_dd_comp`, `update_dd_item`, `add_contact_note`, `upload_lead_image`, `create_campaign`, or `edit_campaign`.
 
-Omit `organizationId` on those searches to cover every membership. A cross-org key must send `organizationId` on every write. If it is missing, the tool returns `ORGANIZATION_REQUIRED` and the company list instead of picking one.
+Omit `organizationId` on searches to cover every membership. `create_lead`, `update_lead`, `add_contact_note`, `upload_lead_image`, and `add_property_to_lead` can also omit it when the record is already in exactly one company this key can see: `create_lead` uses the company that has that `refId`, and the others use the lead's company. If the record is in more than one company, or it cannot be found, the tool returns `ORGANIZATION_REQUIRED` and does not write. Other writes still require `organizationId` for a cross-org key.
 
 ## Tools
 
@@ -57,22 +57,60 @@ Omit `organizationId` on those searches to cover every membership. A cross-org k
 | --- | --- |
 | `list_organizations` | New. Companies the key can use (`organizationId`, `name`, `role`). |
 | `lookup_offer_code` | New. Exact property and campaign-ref matches, then partial property matches, across companies. |
-| `search_leads` | Searches every company by default. Optional `organizationId`. `searchBy` adds `refId`. Hits include company name and id. |
-| `search_properties` | Same, including parcels with no lead. `searchBy` adds `refId`. |
+| `search_leads` | `GET /cross-org/leads/search` across every company unless `organizationId` is set. `searchBy` adds `refId`. `searchBy` `name` groups a seller's parcels. Hits include company name and id. |
+| `search_properties` | `GET /cross-org/properties/search`, including parcels with no lead. `searchBy` `owner` groups a seller's parcels. Hits include company name and id. |
 | `list_campaigns` | Searches every company. Optional `query` and `organizationId`. |
-| `get_lead`, `get_campaign`, `list_lead_images` | Find the record in either company unless `organizationId` is set. |
+| `get_lead`, `get_campaign`, `list_lead_images` | Find the record in either company unless `organizationId` is set. `get_lead` takes `leadId` or `refId` and returns every linked parcel, plus pricing totals. |
 | `list_leads`, `list_properties`, `list_tasks`, `get_kpis`, analytics tools | Still one company (home company unless `organizationId` is set). |
 | `get_due_diligence` | Reads the structured due diligence section for a lead or for a parcel with no lead. |
-| `create_lead`, `update_lead`, `delete_lead`, `add_contact_note` | Take `organizationId` and send it. |
+| `create_lead`, `update_lead`, `add_contact_note` | Take optional `organizationId` and send `X-Organization-Id`. When it is omitted and exactly one company matches, `create_lead` uses the company that has that `refId`, and `update_lead` and `add_contact_note` use the lead's company. |
+| `delete_lead` | Still requires `organizationId` for a cross-org key and sends `X-Organization-Id`. |
+| `add_property_to_lead` | `POST /leads/{leadId}/properties`. Links another parcel by `refId`, or by `apn` with `county` and `state`. Optional per-parcel `offerPrice`, `purchasePrice`, and `sellingPrice`. `organizationId` is optional and defaults to the lead's company when exactly one company has that lead. |
 | `update_property_enrichment` | Sets `enrichmentMarkdown` on a property and stamps `enrichedAt`. Takes `propertyId` and `organizationId`. |
 | `upsert_due_diligence` | Partial update of one parcel's due diligence. `propertyId` or `parcelApn` selects the parcel on a lead and is optional when that lead has one parcel. |
 | `add_dd_comp` | Appends one sold or active comparable with `comps.add` on the same PATCH. |
 | `update_dd_item` | Updates one risk or open item with `items.update` on the same PATCH. |
-| `upload_lead_image`, `delete_lead_image` | Take `organizationId` and send it. |
+| `upload_lead_image` | Optional `organizationId`. When it is omitted and the lead is in exactly one company, the upload uses that company. Image uploads send `image/png`, `image/jpeg`, `image/gif`, or `image/webp` from magic bytes, then the file extension. |
+| `delete_lead_image` | Still requires `organizationId` for a cross-org key. |
 | `create_campaign` | Imports a local CSV or XLSX property file. Requires `name`, a unique `refId` prefix, and `filePath`; sends a multipart upload to the given company. |
 | `edit_campaign`, `delete_campaign` | Take `organizationId` and send it. |
 
 Writes send `X-Organization-Id`. JSON writes also include `organizationId` in the body. Deletes and GETs also send it as a query parameter when it is set.
+
+## Several parcels on one lead
+
+A lead can hold more than one parcel. The API stores that as `lead_property` rows and returns them on `properties` from `GET /leads/{leadId}` and `GET /leads/{leadId}/properties` ([land-tools-api #41](https://github.com/s10mcow/land-tools-api/pull/41)). `add_property_to_lead` posts to `POST /leads/{leadId}/properties`. Ids in those paths are `encodeURIComponent`'d.
+
+`get_lead` uses the `properties` array on the lead when the API sends it (`leadProperties` and `lead_properties` are accepted too) and does not call the list route in that case. A `lead_property` row with a nested `property` is flattened to the parcel: `id` is the property id, prices on the link win, and `leadPropertyId` keeps the link id when it differs. `pricing` sums numeric `offerPrice`, `purchasePrice`, and `sellingPrice`. This server does not invent prices or parcels.
+
+When `organizationId` is omitted, `add_property_to_lead`, `update_lead`, `add_contact_note`, and `upload_lead_image` look the lead up across companies and send `X-Organization-Id` for that company when exactly one match exists. `create_lead` does the same from `GET /cross-org/properties/search?searchBy=refId`. A cross-org key that passes `organizationId` uses that company and does not look the record up.
+
+`get_lead` with `refId` calls `GET /cross-org/leads/search?searchBy=refId`. If that search has no lead, it tries `GET /cross-org/properties/search?searchBy=refId` and reads a lead id on the parcel. The full lead, including `properties`, is then loaded in that company.
+
+```json
+{
+  "leadId": "lead-id-from-get-lead",
+  "refId": "HOL-301-95",
+  "offerPrice": 2000,
+  "organizationId": "company-id-from-the-lead"
+}
+```
+
+Pass `apn`, `county`, and `state` instead of `refId` when the parcel is not already in the company. County and state are required in that case. The tool returns `PROPERTY_IDENTIFIER_REQUIRED` when both `refId` and `apn` are missing, and `COUNTY_AND_STATE_REQUIRED` when an APN has no county or state. It does not call the API for those. `ORGANIZATION_REQUIRED` is the same company-list error as the other writes.
+
+`search_leads` with `searchBy` `name`, and `search_properties` with `searchBy` `owner`, set `groupedBy` to `owner`. Parcels for the same owner name in the same company are one result, with `properties`, `leadIds`, and `pricing`. A lead search also keeps the original hits on `leads`. Address, APN, phone, and ref-id searches stay a flat list. Owner matching ignores case and repeated spaces. The same name in two companies stays two groups.
+
+`pricing` on a lead or an owner group is computed here from numeric `offerPrice`, `purchasePrice`, and `sellingPrice` on the parcels actually returned. `propertyCount` is the number of those parcels. A price field that is missing on some parcels is still summed from the parcels that have it, and `offerPriceCount` (or the matching count field) says how many parcels contributed. This server does not invent prices or parcels.
+
+`s10mcow/land-tools-api` is not in this repo, and this environment could not read that private repository or a live API host. The client calls the routes below and does not fill in parcels the API did not return. When `GET /leads/{leadId}/properties` is missing (`404` whose body says the route cannot be found), `get_lead` returns only the parcel embedded on the lead and sets `propertiesNote`. Deploy the API-key handlers before treating `properties` as the seller's full set:
+
+- Auth: existing API-key middleware. `X-API-Key`, and `X-Organization-Id` when the key is cross-org. Another company's lead id is a 404.
+- `GET /leads/{leadId}`: keep the current lead payload and add `properties`, an array of every parcel linked to that lead. Each parcel includes `id`, `refId`, `apn`, `county`, `state`, `offerPrice`, `purchasePrice`, and `sellingPrice` when those values exist. The singular `property` may stay as the original parcel.
+- `GET /leads/{leadId}/properties`: the same parcel array, or `{ "properties": [ ... ] }`. Empty means the lead has no parcels.
+- `POST /leads/{leadId}/properties`: body is `refId` and/or `apn`, plus `county` and `state` when the caller is finding or creating by APN, plus any of `offerPrice`, `purchasePrice`, `sellingPrice`, and `organizationId` for a cross-org key. `refId` links a parcel already in that company. `apn` + `county` + `state` finds a parcel in that company or creates it, then links it to the lead. Linking a parcel that is already on the lead returns the existing link. Do not detach the lead's other parcels. Return the lead, or the linked parcel, including the prices that were stored.
+- Schema: a lead has many parcels. Prices live on the parcel. The lead total is not a stored column this server writes.
+- `GET /cross-org/leads/search` and `GET /cross-org/properties/search` (and the home-company fallbacks): an owner-name query should return every parcel for that seller, including later parcels linked to an existing lead. This server groups those hits. It cannot group a parcel the search response omitted.
+- `land-bridge-web` needs to render `properties` and the per-parcel prices. That change is not in this repo.
 
 ## Property enrichment
 

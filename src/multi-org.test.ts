@@ -396,6 +396,167 @@ test("upload sends the company header and form field", async () => {
   assert.equal(post?.form?.file, "shot.png");
 });
 
+test("owner-name search groups a seller's parcels and sums pricing", async () => {
+  const { lb } = client((seen) => {
+    if (seen.path === "/cross-org/organizations") return { body: ORGS };
+    if (seen.path.startsWith("/cross-org/leads/search")) {
+      return {
+        body: {
+          leads: [
+            {
+              id: "lead_paula",
+              name: "Paula M Riley",
+              organizationId: "org_north",
+              organizationName: "North Acre Co",
+              property: {
+                id: "p1",
+                apn: "18-27-33-2720-0001-1950",
+                county: "Osceola",
+                state: "FL",
+                offerPrice: 1000,
+              },
+              properties: [
+                {
+                  id: "p1",
+                  apn: "18-27-33-2720-0001-1950",
+                  county: "Osceola",
+                  state: "FL",
+                  offerPrice: 1000,
+                },
+                {
+                  id: "p2",
+                  apn: "08-44-27-L3-02007.0150",
+                  county: "Lee",
+                  state: "FL",
+                  offerPrice: 2500,
+                  purchasePrice: 1800,
+                },
+              ],
+            },
+            {
+              id: "lead_other",
+              name: "Ada Lovelace",
+              organizationId: "org_north",
+              property: { id: "p9", apn: "1", offerPrice: 5 },
+            },
+          ],
+        },
+      };
+    }
+    if (seen.path.startsWith("/cross-org/properties/search")) {
+      return {
+        body: [
+          {
+            id: "p1",
+            ownerName: "Paula M Riley",
+            apn: "18-27-33-2720-0001-1950",
+            county: "Osceola",
+            state: "FL",
+            purchasePrice: 10,
+            organizationId: "org_north",
+            leadId: "lead_paula",
+          },
+          {
+            id: "p2",
+            ownerName: "paula  m riley",
+            apn: "08-44-27-L3-02007.0150",
+            county: "Lee",
+            state: "FL",
+            purchasePrice: 15,
+            organizationId: "org_north",
+          },
+          {
+            id: "p3",
+            ownerName: "Paula M Riley",
+            apn: "99",
+            organizationId: "org_south",
+            sellingPrice: 7,
+          },
+        ],
+      };
+    }
+    return { status: 500, body: { message: seen.path } };
+  });
+
+  const leads = await lb.searchLeads({ query: "Paula", searchBy: "name" });
+  assert.equal(leads.groupedBy, "owner");
+  const leadGroups = leads.results as Array<Record<string, unknown>>;
+  assert.equal(leadGroups.length, 2);
+  const paula = leadGroups[0];
+  assert.equal(paula.ownerName, "Paula M Riley");
+  assert.equal(paula.organizationLabel, "North Acre Co (org_north)");
+  const paulaParcels = paula.properties as Array<Record<string, unknown>>;
+  assert.equal(paulaParcels.length, 2);
+  assert.equal(paulaParcels[1].apn, "08-44-27-L3-02007.0150");
+  assert.equal(paulaParcels[1].organizationId, "org_north");
+  const leadPricing = paula.pricing as Record<string, unknown>;
+  assert.equal(leadPricing.offerPrice, 3500);
+  assert.equal(leadPricing.purchasePrice, 1800);
+  assert.equal(leadPricing.propertyCount, 2);
+  assert.deepEqual(paula.leadIds, ["lead_paula"]);
+
+  const parcels = await lb.searchProperties({ query: "Paula M Riley", searchBy: "owner" });
+  assert.equal(parcels.groupedBy, "owner");
+  const parcelGroups = parcels.results as Array<Record<string, unknown>>;
+  assert.equal(parcelGroups.length, 2);
+  const north = parcelGroups.find((group) => group.organizationId === "org_north");
+  assert.ok(north);
+  assert.equal((north.properties as unknown[]).length, 2);
+  assert.deepEqual(north.leadIds, ["lead_paula"]);
+  assert.equal((north.pricing as Record<string, unknown>).purchasePrice, 25);
+  const south = parcelGroups.find((group) => group.organizationId === "org_south");
+  assert.ok(south);
+  assert.equal((south.properties as unknown[]).length, 1);
+  assert.equal((south.pricing as Record<string, unknown>).sellingPrice, 7);
+
+  const byApn = await lb.searchProperties({ query: "18-27", searchBy: "apn" });
+  assert.equal(byApn.groupedBy, undefined);
+  assert.equal((byApn.results as unknown[]).length, 3);
+});
+
+test("cross-org search labels each hit with the company name and id", async () => {
+  const { lb, calls } = client((seen) => {
+    if (seen.path === "/cross-org/organizations") return { body: ORGS };
+    if (seen.path.startsWith("/cross-org/leads/search")) {
+      return {
+        body: {
+          leads: [
+            { id: "lead_ada", name: "Ada", organizationId: "org_south" },
+            { id: "lead_grace", name: "Grace", organization: { id: "org_north", name: "North Acre Co" } },
+          ],
+        },
+      };
+    }
+    if (seen.path.startsWith("/cross-org/properties/search")) {
+      return {
+        body: [
+          { id: "parcel_1", apn: "18-27", organizationId: "org_north" },
+        ],
+      };
+    }
+    return { status: 500, body: { message: seen.path } };
+  });
+
+  const leads = await lb.searchLeads({ query: "Ada", searchBy: "phone" });
+  assert.equal(leads.crossOrg, true);
+  assert.match(calls[1].path, /\/cross-org\/leads\/search\?/);
+  assert.match(calls[1].path, /searchBy=phone/);
+  assert.equal(orgHeader(calls[1]), null);
+  const leadHits = leads.results as Array<Record<string, unknown>>;
+  assert.equal(leadHits[0].organizationId, "org_south");
+  assert.equal(leadHits[0].organizationName, "South Acre Co");
+  assert.equal(leadHits[0].organizationLabel, "South Acre Co (org_south)");
+  assert.equal(leadHits[1].organizationId, "org_north");
+  assert.equal(leadHits[1].organizationName, "North Acre Co");
+  assert.equal(leadHits[1].organizationLabel, "North Acre Co (org_north)");
+
+  const parcels = await lb.searchProperties({ query: "18-27", searchBy: "apn" });
+  const parcel = (parcels.results as Array<Record<string, unknown>>)[0];
+  assert.equal(parcel.organizationId, "org_north");
+  assert.equal(parcel.organizationName, "North Acre Co");
+  assert.equal(calls.at(-1) && orgHeader(calls.at(-1)!), null);
+});
+
 test("a backend ORGANIZATION_REQUIRED response is rewritten with the company list", async () => {
   const { lb } = client((seen) => {
     if (seen.path === "/cross-org/organizations") return { body: ORGS };

@@ -1,6 +1,6 @@
 {
   "name": "@landbridge/mcp-server",
-  "version": "0.3.1",
+  "version": "0.4.1",
   "description": "LandBridge MCP server — AI assistant tools for land investment CRM",
   "type": "module",
   "main": "dist/index.js",
