@@ -514,6 +514,49 @@ test("owner-name search groups a seller's parcels and sums pricing", async () =>
   assert.equal((byApn.results as unknown[]).length, 3);
 });
 
+test("cross-org search labels each hit with the company name and id", async () => {
+  const { lb, calls } = client((seen) => {
+    if (seen.path === "/cross-org/organizations") return { body: ORGS };
+    if (seen.path.startsWith("/cross-org/leads/search")) {
+      return {
+        body: {
+          leads: [
+            { id: "lead_ada", name: "Ada", organizationId: "org_south" },
+            { id: "lead_grace", name: "Grace", organization: { id: "org_north", name: "North Acre Co" } },
+          ],
+        },
+      };
+    }
+    if (seen.path.startsWith("/cross-org/properties/search")) {
+      return {
+        body: [
+          { id: "parcel_1", apn: "18-27", organizationId: "org_north" },
+        ],
+      };
+    }
+    return { status: 500, body: { message: seen.path } };
+  });
+
+  const leads = await lb.searchLeads({ query: "Ada", searchBy: "phone" });
+  assert.equal(leads.crossOrg, true);
+  assert.match(calls[1].path, /\/cross-org\/leads\/search\?/);
+  assert.match(calls[1].path, /searchBy=phone/);
+  assert.equal(orgHeader(calls[1]), null);
+  const leadHits = leads.results as Array<Record<string, unknown>>;
+  assert.equal(leadHits[0].organizationId, "org_south");
+  assert.equal(leadHits[0].organizationName, "South Acre Co");
+  assert.equal(leadHits[0].organizationLabel, "South Acre Co (org_south)");
+  assert.equal(leadHits[1].organizationId, "org_north");
+  assert.equal(leadHits[1].organizationName, "North Acre Co");
+  assert.equal(leadHits[1].organizationLabel, "North Acre Co (org_north)");
+
+  const parcels = await lb.searchProperties({ query: "18-27", searchBy: "apn" });
+  const parcel = (parcels.results as Array<Record<string, unknown>>)[0];
+  assert.equal(parcel.organizationId, "org_north");
+  assert.equal(parcel.organizationName, "North Acre Co");
+  assert.equal(calls.at(-1) && orgHeader(calls.at(-1)!), null);
+});
+
 test("a backend ORGANIZATION_REQUIRED response is rewritten with the company list", async () => {
   const { lb } = client((seen) => {
     if (seen.path === "/cross-org/organizations") return { body: ORGS };

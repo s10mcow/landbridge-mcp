@@ -26,7 +26,7 @@ import { buildAddPropertyBody } from "./lead-properties.js";
 
 const server = new McpServer({
   name: "landbridge",
-  version: "0.4.0",
+  version: "0.4.1",
 });
 
 const api = createApiClientFromEnv();
@@ -82,6 +82,13 @@ const writeOrg = z
   .optional()
   .describe(
     "Company id (organizationId) this change belongs to. Required for cross-org API keys, even with only one current membership. Copy it from the search hit or from list_organizations. If you omit it, the tool lists the companies instead of guessing.",
+  );
+
+const recordWriteOrg = z
+  .string()
+  .optional()
+  .describe(
+    "Company id (organizationId) this change belongs to. Copy it from the search hit when you have it. If you omit it and the record is in exactly one company this key can see, the write uses that company and sends X-Organization-Id. If it is in more than one company, or it cannot be found, the tool lists the companies and does not write.",
   );
 
 const filterOrg = z
@@ -150,13 +157,26 @@ server.tool(
 
 server.tool(
   "get_lead",
-  "Get a lead by id, including every linked parcel. Checks every company this key belongs to unless organizationId is set. The result is labeled with organizationName and organizationId. properties lists each parcel the API returned, and pricing sums offerPrice, purchasePrice, and sellingPrice across those parcels when the API sent numbers. Pass organizationId from the lead to add_property_to_lead.",
+  "Get a lead by id or property ref id, including every linked parcel. Checks every company this key belongs to unless organizationId is set. The result is labeled with organizationName and organizationId. properties lists each parcel. A lead_property link is flattened onto that parcel, and leadPropertyId keeps the link id. pricing sums offerPrice, purchasePrice, and sellingPrice across those parcels when the API sent numbers.",
   {
-    leadId: z.string().describe("The lead ID"),
+    leadId: z.string().trim().min(1).optional().describe("The lead ID"),
+    refId: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .describe("Property ref id, such as HOL-301-95. Searches every company unless organizationId is set."),
     organizationId: lookupOrg,
   },
-  async ({ leadId, organizationId }) =>
-    run(async () => oneOrMany("Lead", await lb.readLead(leadId, organizationId))),
+  async ({ leadId, refId, organizationId }) =>
+    run(async () => {
+      if (leadId) return oneOrMany("Lead", await lb.readLead(leadId, organizationId));
+      if (refId) return oneOrMany("Lead", await lb.readLeadByRef(refId, organizationId));
+      return fail({
+        error: "LEAD_LOOKUP_REQUIRED",
+        message: "Pass leadId or refId.",
+      });
+    }),
 );
 
 server.tool(
@@ -187,7 +207,7 @@ server.tool(
 
 server.tool(
   "search_leads",
-  "Search leads across every company by name, address, APN, phone, or property ref id. Omit organizationId to cover all companies. Each hit includes organizationName, organizationId, and organizationLabel. searchBy name sets groupedBy to owner. Each grouped result has ownerName, leadIds, the original leads, properties, and pricing summed from the parcel prices the API returned. Other searchBy values stay a flat list. Pass organizationId to create_lead, update_lead, add_property_to_lead, add_contact_note, or the due diligence tools.",
+  "Search leads across every company by name, address, APN, phone, or property ref id. This calls GET /cross-org/leads/search unless organizationId limits it to one company, or the key cannot act across companies. Each hit includes organizationName, organizationId, and organizationLabel. searchBy name sets groupedBy to owner. Each grouped result has ownerName, leadIds, the original leads, properties, and pricing summed from the parcel prices the API returned. Other searchBy values stay a flat list. Pass organizationId to create_lead, update_lead, add_property_to_lead, add_contact_note, or the due diligence tools.",
   {
     query: z.string().describe("Search term"),
     searchBy: z
@@ -248,7 +268,7 @@ server.tool(
 
 server.tool(
   "search_properties",
-  "Search parcels across every company by address, APN, owner name, or ref id, including parcels with no lead. Omit organizationId to cover all companies. Each hit includes organizationName and organizationId. searchBy owner sets groupedBy to owner. Each grouped result has ownerName, leadIds, properties, and pricing for one company. The same owner in another company is a separate result. Other searchBy values stay a flat list.",
+  "Search parcels across every company by address, APN, owner name, or ref id, including parcels with no lead. This calls GET /cross-org/properties/search unless organizationId limits it to one company, or the key cannot act across companies. Each hit includes organizationName and organizationId. searchBy owner sets groupedBy to owner. Each grouped result has ownerName, leadIds, properties, and pricing for one company. The same owner in another company is a separate result. Other searchBy values stay a flat list.",
   {
     query: z.string().describe("Search term (street, APN, owner name, or ref id)"),
     searchBy: z
@@ -528,10 +548,10 @@ server.tool(
 
 server.tool(
   "update_lead",
-  "Update a lead's stage, contact info, or pricing in a specific company. The lead must already belong to that company. Pass organizationId from the search hit.",
+  "Update a lead's stage, contact info, or pricing in a specific company. Pass organizationId from the lead. If you omit it and this key can see that lead in exactly one company, the write uses that company.",
   {
     leadId: z.string().describe("The lead ID"),
-    organizationId: writeOrg,
+    organizationId: recordWriteOrg,
     stage: z
       .string()
       .optional()
@@ -544,35 +564,37 @@ server.tool(
     notes: z.string().optional(),
   },
   async ({ leadId, organizationId, ...updates }) =>
-    run(async () => fromMutate(await lb.mutate({
+    run(async () => fromMutate(await lb.mutateForRecord({
       method: "PATCH",
       path: `/leads/${leadId}`,
       organizationId,
+      leadId,
       body: updates,
     }))),
 );
 
 server.tool(
   "create_lead",
-  "Create a lead from a property ref id in a specific company. The parcel must already be in that company. Pass organizationId from lookup_offer_code or search_properties. To attach another parcel to a lead that already exists, use add_property_to_lead.",
+  "Create a lead from a property ref id. The parcel must already be in the company. Pass organizationId when you know it. If you omit it and exactly one company has that ref id, the lead is created there.",
   {
     refId: z
       .string()
       .describe("Property reference id. Dashes are optional (PBCS10152063 or PB-CS-1015-2063)."),
-    organizationId: writeOrg,
+    organizationId: recordWriteOrg,
   },
   async ({ refId, organizationId }) =>
-    run(async () => fromMutate(await lb.mutate({
+    run(async () => fromMutate(await lb.mutateForRecord({
       method: "POST",
       path: "/leads",
       organizationId,
+      refId,
       body: { refId },
     }))),
 );
 
 server.tool(
   "add_property_to_lead",
-  "Link another parcel to an existing lead, or create that parcel in the lead's company and link it. A seller can own more than one parcel on the same lead. Pass refId to link a parcel already in the company, or apn with county and state to find or create the parcel. offerPrice, purchasePrice, and sellingPrice are stored on that parcel. Pass organizationId from the lead. A cross-org key has to pass organizationId.",
+  "Link another parcel to an existing lead, or create that parcel in the lead's company and link it. A seller can own more than one parcel on the same lead. Pass refId to link a parcel already in the company, or apn with county and state to find or create the parcel. offerPrice, purchasePrice, and sellingPrice are stored on that parcel. Pass organizationId from the lead. If you omit it and the lead is in exactly one company this key can see, the link is written there.",
   {
     leadId: z.string().trim().min(1).describe("The lead ID"),
     refId: z
@@ -587,16 +609,17 @@ server.tool(
     offerPrice: z.number().finite().nonnegative().optional().describe("Offer price for this parcel."),
     purchasePrice: z.number().finite().nonnegative().optional().describe("Purchase price for this parcel."),
     sellingPrice: z.number().finite().nonnegative().optional().describe("Selling price for this parcel."),
-    organizationId: writeOrg,
+    organizationId: recordWriteOrg,
   },
   async ({ leadId, organizationId, ...fields }) =>
     run(async () => {
       const built = buildAddPropertyBody(fields);
       if (!built.ok) return fail(built.error);
-      return fromMutate(await lb.mutate({
+      return fromMutate(await lb.mutateForRecord({
         method: "POST",
         path: `/leads/${encodeURIComponent(leadId)}/properties`,
         organizationId,
+        leadId,
         body: built.body,
       }));
     }),
@@ -618,17 +641,18 @@ server.tool(
 
 server.tool(
   "add_contact_note",
-  "Add a note to a lead in a specific company. Pass organizationId from the lead.",
+  "Add a note to a lead in a specific company. Pass organizationId from the lead. If you omit it and the lead is in exactly one company this key can see, the note is written there.",
   {
     leadId: z.string().describe("The lead ID"),
     content: z.string().describe("The note content"),
-    organizationId: writeOrg,
+    organizationId: recordWriteOrg,
   },
   async ({ leadId, content, organizationId }) =>
-    run(async () => fromMutate(await lb.mutate({
+    run(async () => fromMutate(await lb.mutateForRecord({
       method: "POST",
       path: `/leads/${leadId}/contact-notes`,
       organizationId,
+      leadId,
       body: { content },
     }))),
 );
@@ -654,23 +678,24 @@ server.tool(
 
 server.tool(
   "upload_lead_image",
-  "Upload a screenshot or image to a lead from a local file path. PNG, JPEG, GIF, and WebP are detected from the file bytes, then from the extension, and uploaded with that content type. Pass organizationId for the company that owns the lead.",
+  "Upload a screenshot or image to a lead from a local file path. PNG, JPEG, GIF, and WebP are detected from the file bytes, then from the extension, and uploaded with that content type. Pass organizationId for the company that owns the lead. If you omit it and the lead is in exactly one company this key can see, the upload goes there.",
   {
     leadId: z.string().describe("The lead ID"),
     filePath: z.string().describe("Absolute path to the image file on disk"),
     description: z.string().optional().describe("Optional description of the screenshot"),
-    organizationId: writeOrg,
+    organizationId: recordWriteOrg,
   },
   async ({ leadId, filePath, description, organizationId }) =>
     run(async () => {
       if (!existsSync(filePath)) return ok("File not found: " + filePath);
       const fields: Record<string, string> = {};
       if (description) fields.description = description;
-      return fromMutate(await lb.upload({
+      return fromMutate(await lb.uploadForRecord({
         path: `/leads/${leadId}/images`,
         filePath,
         fields,
         organizationId,
+        leadId,
       }));
     }),
 );

@@ -55,16 +55,45 @@ export function buildAddPropertyBody(
   return { ok: true, body };
 }
 
+export function embeddedPropertyList(lead: Record<string, unknown>): unknown[] | undefined {
+  for (const key of ["properties", "leadProperties", "lead_properties"] as const) {
+    if (Array.isArray(lead[key])) return lead[key] as unknown[];
+  }
+  return undefined;
+}
+
+export function normalizeParcel(value: unknown): Record<string, unknown> | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const nested = isPlainObject(value.property) ? value.property : undefined;
+  if (!nested) return value;
+  const propertyId = readString(value.propertyId) || readString(nested.id) || readString(nested.propertyId);
+  const linkId = readString(value.id);
+  const parcel: Record<string, unknown> = { ...nested };
+  if (propertyId) {
+    parcel.id = propertyId;
+    parcel.propertyId = propertyId;
+  }
+  if (linkId && linkId !== propertyId) parcel.leadPropertyId = linkId;
+  for (const field of ["apn", "refId", "county", "state", "leadId", "organizationId", "organizationName", "organizationLabel"]) {
+    if (parcel[field] === undefined && value[field] !== undefined && value[field] !== null) {
+      parcel[field] = value[field];
+    }
+  }
+  for (const field of PRICE_FIELDS) {
+    if (typeof value[field] === "number") parcel[field] = value[field];
+  }
+  return parcel;
+}
 export function applyLeadProperties(
   lead: Record<string, unknown>,
   listed: unknown[] | undefined,
   options: { listUnavailable: boolean },
 ): Record<string, unknown> {
-  const embeddedList = Array.isArray(lead.properties) ? lead.properties : undefined;
+  const embeddedList = embeddedPropertyList(lead);
   const source = embeddedList ?? listed;
   const properties = dedupeProperties([
-    ...objectsFrom(source),
-    ...(isPlainObject(lead.property) ? [lead.property] : []),
+    ...normalizeMany(source),
+    ...normalizeMany(isPlainObject(lead.property) ? [lead.property] : undefined),
   ]);
   const next: Record<string, unknown> = { ...lead, properties };
   if (options.listUnavailable && embeddedList === undefined) {
@@ -157,12 +186,20 @@ export function pricingTotals(
 
 function parcelsOf(hit: Record<string, unknown>, kind: "lead" | "property"): Array<Record<string, unknown>> {
   const nested = dedupeProperties([
-    ...(isPlainObject(hit.property) ? [hit.property] : []),
-    ...objectsFrom(Array.isArray(hit.properties) ? hit.properties : undefined),
+    ...normalizeMany(isPlainObject(hit.property) ? [hit.property] : undefined),
+    ...normalizeMany(embeddedPropertyList(hit)),
   ]);
   if (nested.length > 0) return nested;
-  if (kind === "property") return [hit];
+  if (kind === "property") return normalizeMany([hit]);
   return [];
+}
+
+function normalizeMany(value: unknown[] | undefined): Array<Record<string, unknown>> {
+  if (!value) return [];
+  return value.flatMap((item) => {
+    const parcel = normalizeParcel(item);
+    return parcel ? [parcel] : [];
+  });
 }
 
 function dedupeProperties(items: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
@@ -205,11 +242,6 @@ function ownerNameOf(hit: Record<string, unknown>, kind: "lead" | "property"): s
 function normalizeOwner(name: string | undefined): string | undefined {
   const normalized = name?.trim().toLowerCase().replace(/\s+/g, " ");
   return normalized ? normalized : undefined;
-}
-
-function objectsFrom(value: unknown[] | undefined): Array<Record<string, unknown>> {
-  if (!value) return [];
-  return value.filter(isPlainObject);
 }
 
 function roundMoney(value: number): number {

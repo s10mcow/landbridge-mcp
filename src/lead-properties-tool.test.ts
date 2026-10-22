@@ -246,6 +246,14 @@ test("add_property_to_lead creates or links a parcel on an existing lead", async
         json(res, 200, CROSS_ORGS);
         return;
       }
+      if (seen.method === "GET" && seen.path.startsWith("/leads/lead%2F1")) {
+        if (seen.org === "org-south") {
+          json(res, 200, { id: "lead/1", name: "Paula M Riley", organizationId: "org-south" });
+          return;
+        }
+        json(res, 404, { message: "Not found", code: "NOT_FOUND" });
+        return;
+      }
       if (seen.method === "POST" && seen.path === "/leads/lead%2F1/properties") {
         json(res, 200, { leadId: "lead/1", propertyId: "p_new", ...(seen.body as object) });
         return;
@@ -319,9 +327,159 @@ test("add_property_to_lead creates or links a parcel on an existing lead", async
         name: "add_property_to_lead",
         arguments: { leadId: "lead/1", refId: "HOL-301-95" },
       });
-      assert.equal(noOrg.isError, true);
-      assert.equal(JSON.parse(textOf(noOrg)).error, "ORGANIZATION_REQUIRED");
-      assert.equal(calls.filter((call) => call.method === "POST").length, postsBefore);
+      assert.equal(noOrg.isError, undefined, textOf(noOrg));
+      const defaultPost = calls.filter((call) => call.method === "POST").at(-1);
+      assert.equal(defaultPost?.org, "org-south");
+      assert.equal(defaultPost?.apiKey, "test-only");
+      assert.equal((defaultPost?.body as { organizationId?: string }).organizationId, "org-south");
+      assert.ok(
+        calls.slice(postsBefore).some(
+          (call) => call.method === "GET" && call.path.startsWith("/leads/lead%2F1") && call.org === "org-south",
+        ),
+      );
+    },
+  );
+});
+
+test("a lead in both companies still requires organizationId", async () => {
+  await withMcp(
+    (_req, res, seen) => {
+      if (seen.path === "/cross-org/organizations") {
+        json(res, 200, CROSS_ORGS);
+        return;
+      }
+      if (seen.method === "GET" && seen.path.startsWith("/leads/lead_both")) {
+        json(res, 200, { id: "lead_both", name: "Paula", organizationId: seen.org });
+        return;
+      }
+      if (seen.method === "POST") {
+        json(res, 500, { message: "should not write" });
+        return;
+      }
+      json(res, 500, { message: `unexpected ${seen.method} ${seen.path}` });
+    },
+    async (client, calls) => {
+      const result = await client.callTool({
+        name: "update_lead",
+        arguments: { leadId: "lead_both", stage: "NEGOTIATING" },
+      });
+      assert.equal(result.isError, true);
+      const body = JSON.parse(textOf(result)) as { error: string; organizations: unknown[] };
+      assert.equal(body.error, "ORGANIZATION_REQUIRED");
+      assert.equal(body.organizations.length, 2);
+      assert.equal(calls.some((call) => call.method === "POST" || call.method === "PATCH"), false);
+    },
+  );
+});
+
+test("get_lead finds a ref id across companies and flattens lead_property rows", async () => {
+  await withMcp(
+    (_req, res, seen) => {
+      if (seen.path === "/cross-org/organizations") {
+        json(res, 200, CROSS_ORGS);
+        return;
+      }
+      if (seen.method === "GET" && seen.path.startsWith("/cross-org/leads/search")) {
+        assert.match(seen.path, /searchBy=refId/);
+        assert.match(seen.path, /query=HOL-301-95/);
+        assert.equal(seen.org, undefined);
+        assert.equal(seen.apiKey, "test-only");
+        json(res, 200, {
+          leads: [{ id: "lead_paula", organizationId: "org-south" }],
+        });
+        return;
+      }
+      if (seen.method === "GET" && seen.path.startsWith("/leads/lead_paula")) {
+        assert.equal(seen.org, "org-south");
+        json(res, 200, {
+          id: "lead_paula",
+          name: "Paula M Riley",
+          organizationId: "org-south",
+          properties: [
+            {
+              id: "link_1",
+              leadId: "lead_paula",
+              propertyId: "p2",
+              offerPrice: 2000,
+              purchasePrice: 1800,
+              sellingPrice: 2500,
+              property: {
+                id: "p2",
+                apn: "08-44-27-L3-02007.0150",
+                county: "Lee",
+                state: "FL",
+                refId: "HOL-301-95",
+              },
+            },
+          ],
+        });
+        return;
+      }
+      json(res, 500, { message: `unexpected ${seen.method} ${seen.path}` });
+    },
+    async (client) => {
+      const result = await client.callTool({
+        name: "get_lead",
+        arguments: { refId: "HOL-301-95" },
+      });
+      assert.equal(result.isError, undefined, textOf(result));
+      const lead = JSON.parse(textOf(result)) as {
+        name: string;
+        organizationId: string;
+        organizationName: string;
+        properties: Array<Record<string, unknown>>;
+        pricing: { offerPrice: number; purchasePrice: number; sellingPrice: number };
+      };
+      assert.equal(lead.name, "Paula M Riley");
+      assert.equal(lead.organizationId, "org-south");
+      assert.equal(lead.organizationName, "South");
+      assert.equal(lead.properties.length, 1);
+      assert.equal(lead.properties[0].id, "p2");
+      assert.equal(lead.properties[0].leadPropertyId, "link_1");
+      assert.equal(lead.properties[0].apn, "08-44-27-L3-02007.0150");
+      assert.equal(lead.properties[0].refId, "HOL-301-95");
+      assert.equal(lead.properties[0].offerPrice, 2000);
+      assert.equal(lead.pricing.offerPrice, 2000);
+      assert.equal(lead.pricing.purchasePrice, 1800);
+      assert.equal(lead.pricing.sellingPrice, 2500);
+    },
+  );
+});
+
+test("create_lead uses the company that already has the ref id", async () => {
+  await withMcp(
+    (_req, res, seen) => {
+      if (seen.path === "/cross-org/organizations") {
+        json(res, 200, CROSS_ORGS);
+        return;
+      }
+      if (seen.method === "GET" && seen.path.startsWith("/cross-org/properties/search")) {
+        assert.match(seen.path, /searchBy=refId/);
+        assert.equal(seen.org, undefined);
+        json(res, 200, {
+          properties: [
+            { id: "parcel_1", refId: "HOL-301-95", organizationId: "org-north" },
+          ],
+        });
+        return;
+      }
+      if (seen.method === "POST" && seen.path === "/leads") {
+        json(res, 200, { id: "lead_new" });
+        return;
+      }
+      json(res, 500, { message: `unexpected ${seen.method} ${seen.path}` });
+    },
+    async (client, calls) => {
+      const result = await client.callTool({
+        name: "create_lead",
+        arguments: { refId: "HOL-301-95" },
+      });
+      assert.equal(result.isError, undefined, textOf(result));
+      const post = calls.find((call) => call.method === "POST");
+      assert.ok(post);
+      assert.equal(post.org, "org-north");
+      assert.equal(post.apiKey, "test-only");
+      assert.deepEqual(post.body, { refId: "HOL-301-95", organizationId: "org-north" });
     },
   );
 });
